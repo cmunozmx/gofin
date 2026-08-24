@@ -12,11 +12,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gofin/internal/jfauth"
 	"gofin/internal/jfid"
+	"gofin/internal/jfscan"
+	"gofin/internal/jftmdb"
 )
 
 // Hashes produced by an independent PBKDF2-HMAC-SHA512 implementation (Python's
@@ -63,6 +67,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		cfg:      cfg,
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    store,
+		items:    NewItemStore(),
 		serverID: jfid.HashString("gofin-server:Test Server", jfid.UTF16LE),
 		started:  time.Now(),
 	}
@@ -965,7 +970,7 @@ func TestSessionsReturnsEmptyArray(t *testing.T) {
 // an empty body, and must say 501 so the gap is visible.
 func TestUnimplementedRoutesReturn501(t *testing.T) {
 	e := newTestEnv(t)
-	for _, path := range []string{"/UserViews", "/Items", "/Library/VirtualFolders", "/nonsense"} {
+	for _, path := range []string{"/Library/VirtualFolders", "/Shows/NextUp", "/nonsense"} {
 		t.Run(path, func(t *testing.T) {
 			w := e.do(t, "GET", path, "", nil)
 			if w.Code != 501 {
@@ -1242,4 +1247,1749 @@ func TestSocketRequiresAuth(t *testing.T) {
 			t.Errorf("token %q: status = %d, want 401", token, w.Code)
 		}
 	}
+}
+
+// ---------------------------------------------------------------- libraries
+
+func boolPtr(b bool) *bool { return &b }
+
+// The safe default is the whole reason ReadOnly is a pointer: an omitted field
+// must not mean "writable", because bool's zero value would make silence the
+// dangerous answer.
+func TestLibraryReadOnlyDefaultsToTrue(t *testing.T) {
+	if !(Library{Path: "/m"}).IsReadOnly() {
+		t.Error("an unset readonly must default to read-only")
+	}
+	if !(Library{Path: "/m", ReadOnly: boolPtr(true)}).IsReadOnly() {
+		t.Error("readonly=true must be read-only")
+	}
+	if (Library{Path: "/m", ReadOnly: boolPtr(false)}).IsReadOnly() {
+		t.Error("readonly=false must be writable")
+	}
+}
+
+// A library declared in JSON with no "readonly" key is read-only, and one that
+// explicitly says false is not.
+func TestLibraryReadOnlyThroughJSON(t *testing.T) {
+	cases := []struct {
+		json string
+		want bool
+	}{
+		{`{"name":"M","path":"/m","type":"movies"}`, true},
+		{`{"name":"M","path":"/m","type":"movies","readonly":true}`, true},
+		{`{"name":"M","path":"/m","type":"movies","readonly":false}`, false},
+		{`{"name":"M","path":"/m","type":"movies","readonly":null}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.json, func(t *testing.T) {
+			var l Library
+			if err := json.Unmarshal([]byte(c.json), &l); err != nil {
+				t.Fatal(err)
+			}
+			if got := l.IsReadOnly(); got != c.want {
+				t.Errorf("IsReadOnly = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeLibraries(t *testing.T) {
+	libs, err := normalizeLibraries([]Library{
+		{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+		{Name: "Music", Path: "/mnt/alberca/Music", Type: "music"},
+	}, "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(libs) != 2 {
+		t.Fatalf("got %d libraries, want 2", len(libs))
+	}
+	for _, l := range libs {
+		if !l.IsReadOnly() {
+			t.Errorf("library %q should default to read-only", l.Name)
+		}
+		// Normalization must pin the effective value so --dry-run shows what is
+		// actually in force rather than a null.
+		if l.ReadOnly == nil {
+			t.Errorf("library %q left ReadOnly unset after normalization", l.Name)
+		}
+	}
+}
+
+func TestNormalizeLibrariesMakesPathsAbsolute(t *testing.T) {
+	libs, err := normalizeLibraries([]Library{
+		{Name: "Rel", Path: "./media/movies", Type: "movies"},
+		{Name: "Messy", Path: "/mnt/alberca/Music/", Type: "music"},
+	}, "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if libs[0].Path != "/wd/media/movies" {
+		t.Errorf("relative path = %q, want /wd/media/movies", libs[0].Path)
+	}
+	// A trailing separator must be cleaned, or the overlap check below compares
+	// inconsistent strings.
+	if libs[1].Path != "/mnt/alberca/Music" {
+		t.Errorf("path = %q, want the trailing slash cleaned", libs[1].Path)
+	}
+}
+
+func TestNormalizeLibrariesDefaultsNameToDirectory(t *testing.T) {
+	libs, err := normalizeLibraries([]Library{
+		{Path: "/mnt/alberca/Movies", Type: "movies"},
+	}, "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if libs[0].Name != "Movies" {
+		t.Errorf("name = %q, want the directory name Movies", libs[0].Name)
+	}
+}
+
+func TestNormalizeLibrariesTypeIsCaseInsensitive(t *testing.T) {
+	libs, err := normalizeLibraries([]Library{
+		{Name: "M", Path: "/m", Type: "Movies"},
+		{Name: "T", Path: "/t", Type: "  TVShows  "},
+	}, "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if libs[0].Type != "movies" || libs[1].Type != "tvshows" {
+		t.Errorf("types not normalized: %q, %q", libs[0].Type, libs[1].Type)
+	}
+}
+
+func TestNormalizeLibrariesAcceptsMixedContent(t *testing.T) {
+	if _, err := normalizeLibraries([]Library{{Name: "Mixed", Path: "/m"}}, "/wd"); err != nil {
+		t.Errorf("an empty type means mixed content and must be allowed: %v", err)
+	}
+}
+
+func TestNormalizeLibrariesRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Library
+		want string
+	}{
+		{
+			"missing path",
+			[]Library{{Name: "Movies", Type: "movies"}},
+			"path is required",
+		},
+		{
+			"unknown type",
+			[]Library{{Name: "Movies", Path: "/m", Type: "films"}},
+			"unknown type",
+		},
+		{
+			"duplicate name",
+			[]Library{
+				{Name: "Movies", Path: "/a", Type: "movies"},
+				{Name: "Movies", Path: "/b", Type: "movies"},
+			},
+			"duplicate name",
+		},
+		{
+			// Names are matched case-insensitively, the way clients treat them.
+			"duplicate name differing only in case",
+			[]Library{
+				{Name: "Movies", Path: "/a", Type: "movies"},
+				{Name: "MOVIES", Path: "/b", Type: "movies"},
+			},
+			"duplicate name",
+		},
+		{
+			"duplicate path",
+			[]Library{
+				{Name: "A", Path: "/mnt/media", Type: "movies"},
+				{Name: "B", Path: "/mnt/media", Type: "music"},
+			},
+			"already used",
+		},
+		{
+			// The same path written two ways is still the same path.
+			"duplicate path after cleaning",
+			[]Library{
+				{Name: "A", Path: "/mnt/media", Type: "movies"},
+				{Name: "B", Path: "/mnt/media/", Type: "music"},
+			},
+			"already used",
+		},
+		{
+			// Nesting makes every item in the overlap resolve twice, under two
+			// parents and two different IDs.
+			"library nested inside another",
+			[]Library{
+				{Name: "All", Path: "/mnt/alberca", Type: "mixed"},
+				{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+			},
+			"overlaps",
+		},
+		{
+			"library containing another, declared in the other order",
+			[]Library{
+				{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+				{Name: "All", Path: "/mnt/alberca", Type: "mixed"},
+			},
+			"overlaps",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := normalizeLibraries(c.in, "/wd")
+			if err == nil {
+				t.Fatalf("normalizeLibraries accepted %+v", c.in)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error = %q, want it to mention %q", err, c.want)
+			}
+		})
+	}
+}
+
+// Sibling directories that share a name prefix are not nested. Comparing raw
+// string prefixes rather than whole path elements would reject this.
+func TestNormalizeLibrariesAllowsPrefixSiblings(t *testing.T) {
+	_, err := normalizeLibraries([]Library{
+		{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+		{Name: "Movies4K", Path: "/mnt/alberca/Movies4K", Type: "movies"},
+	}, "/wd")
+	if err != nil {
+		t.Errorf("sibling directories sharing a prefix are not nested: %v", err)
+	}
+}
+
+func TestPathContains(t *testing.T) {
+	cases := []struct {
+		parent, child string
+		want          bool
+	}{
+		{"/a/b", "/a/b", true},
+		{"/a/b", "/a/b/c", true},
+		{"/a/b", "/a/b/c/d", true},
+		{"/a/b", "/a/bc", false},
+		{"/a/b", "/a", false},
+		{"/a/b", "/x/y", false},
+		{"/", "/anything", true},
+	}
+	for _, c := range cases {
+		if got := pathContains(c.parent, c.child); got != c.want {
+			t.Errorf("pathContains(%q, %q) = %v, want %v", c.parent, c.child, got, c.want)
+		}
+	}
+}
+
+func TestNormalizeLibrariesEmpty(t *testing.T) {
+	libs, err := normalizeLibraries(nil, "/wd")
+	if err != nil {
+		t.Fatalf("no libraries is a valid configuration: %v", err)
+	}
+	if len(libs) != 0 {
+		t.Errorf("got %d libraries, want none", len(libs))
+	}
+}
+
+// ------------------------------------------------------- path validation
+
+func TestValidateLibraryPaths(t *testing.T) {
+	dir := t.TempDir()
+	movies := filepath.Join(dir, "Movies")
+	if err := os.Mkdir(movies, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("readable directory", func(t *testing.T) {
+		if err := validateLibraryPaths([]Library{{Name: "Movies", Path: movies}}); err != nil {
+			t.Errorf("a readable directory should validate: %v", err)
+		}
+	})
+
+	t.Run("empty directory is fine", func(t *testing.T) {
+		// An empty media root is normal on first run; ReadDir returning EOF
+		// must not be mistaken for an error.
+		if err := validateLibraryPaths([]Library{{Name: "Empty", Path: movies}}); err != nil {
+			t.Errorf("an empty library must be allowed: %v", err)
+		}
+	})
+
+	t.Run("missing path", func(t *testing.T) {
+		err := validateLibraryPaths([]Library{{Name: "Gone", Path: filepath.Join(dir, "nope")}})
+		if err == nil {
+			t.Fatal("a missing path should fail validation")
+		}
+		if !strings.Contains(err.Error(), "Gone") {
+			t.Errorf("error = %q, want it to name the library", err)
+		}
+	})
+
+	t.Run("path is a file", func(t *testing.T) {
+		file := filepath.Join(dir, "notadir.mkv")
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := validateLibraryPaths([]Library{{Name: "File", Path: file}})
+		if err == nil {
+			t.Fatal("a regular file should fail validation")
+		}
+		if !strings.Contains(err.Error(), "not a directory") {
+			t.Errorf("error = %q, want it to say the path is not a directory", err)
+		}
+	})
+}
+
+// A directory that stats fine but cannot be listed is the classic "service user
+// lacks permission" case, and must fail at startup rather than scan as empty.
+func TestValidateLibraryPathsUnreadableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+
+	if err := validateLibraryPaths([]Library{{Name: "Locked", Path: locked}}); err == nil {
+		t.Error("an unreadable directory should fail validation")
+	}
+}
+
+// ------------------------------------------------------- library config chain
+
+func TestLoadLibrariesFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gofin.json")
+	if err := os.WriteFile(path, []byte(`{"libraries":[
+		{"name":"Movies","path":"/mnt/alberca/Movies","type":"movies","readonly":true},
+		{"name":"Music","path":"/mnt/alberca/Music","type":"music","readonly":true}
+	]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := newFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := load(fs, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Libraries) != 2 {
+		t.Fatalf("got %d libraries, want 2", len(cfg.Libraries))
+	}
+	if cfg.Libraries[0].Name != "Movies" || cfg.Libraries[0].Path != "/mnt/alberca/Movies" {
+		t.Errorf("first library = %+v", cfg.Libraries[0])
+	}
+	if cfg.Libraries[1].Type != "music" {
+		t.Errorf("second library type = %q, want music", cfg.Libraries[1].Type)
+	}
+	for _, l := range cfg.Libraries {
+		if !l.IsReadOnly() {
+			t.Errorf("library %q should be read-only", l.Name)
+		}
+	}
+}
+
+func TestLoadLibrariesFromEnv(t *testing.T) {
+	t.Setenv("GOFIN_LIBRARIES",
+		`[{"name":"Movies","path":"/mnt/alberca/Movies","type":"movies"}]`)
+
+	fs := newFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := load(fs, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Libraries) != 1 || cfg.Libraries[0].Name != "Movies" {
+		t.Fatalf("libraries = %+v", cfg.Libraries)
+	}
+}
+
+func TestLoadLibrariesEnvOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gofin.json")
+	if err := os.WriteFile(path, []byte(
+		`{"libraries":[{"name":"FromFile","path":"/a","type":"movies"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOFIN_LIBRARIES", `[{"name":"FromEnv","path":"/b","type":"music"}]`)
+
+	fs := newFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := load(fs, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Libraries) != 1 || cfg.Libraries[0].Name != "FromEnv" {
+		t.Errorf("libraries = %+v, want the env value to win", cfg.Libraries)
+	}
+}
+
+func TestLoadLibrariesBadEnvJSON(t *testing.T) {
+	t.Setenv("GOFIN_LIBRARIES", `not json`)
+	fs := newFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := load(fs, ""); err == nil {
+		t.Error("malformed GOFIN_LIBRARIES should be an error, not silently ignored")
+	}
+}
+
+// An invalid library must stop startup rather than be dropped silently, which
+// would present as a library that simply never appears.
+func TestLoadRejectsInvalidLibrary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gofin.json")
+	if err := os.WriteFile(path, []byte(
+		`{"libraries":[{"name":"Movies","path":"/a","type":"nonsense"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := load(fs, path); err == nil {
+		t.Error("an unknown collection type should fail the load")
+	}
+}
+
+// ------------------------------------------------------------ -library flag
+
+func TestLibraryFlagParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want Library
+	}{
+		{
+			"all fields",
+			"name=Movies,type=movies,path=/mnt/alberca/Movies,readonly",
+			Library{Name: "Movies", Type: "movies", Path: "/mnt/alberca/Movies", ReadOnly: boolPtr(true)},
+		},
+		{
+			"path only",
+			"path=/mnt/alberca/Music",
+			Library{Path: "/mnt/alberca/Music"},
+		},
+		{
+			"explicit readonly=false",
+			"path=/m,readonly=false",
+			Library{Path: "/m", ReadOnly: boolPtr(false)},
+		},
+		{
+			"writable alias",
+			"path=/m,writable",
+			Library{Path: "/m", ReadOnly: boolPtr(false)},
+		},
+		{
+			"ro alias",
+			"path=/m,ro",
+			Library{Path: "/m", ReadOnly: boolPtr(true)},
+		},
+		{
+			"whitespace and key casing are tolerated",
+			" Name=Movies , TYPE=movies , path=/m ",
+			Library{Name: "Movies", Type: "movies", Path: "/m"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var l libraryList
+			if err := l.Set(c.in); err != nil {
+				t.Fatalf("Set(%q): %v", c.in, err)
+			}
+			if len(l) != 1 {
+				t.Fatalf("got %d libraries, want 1", len(l))
+			}
+			got := l[0]
+			if got.Name != c.want.Name || got.Type != c.want.Type || got.Path != c.want.Path {
+				t.Errorf("got %+v, want %+v", got, c.want)
+			}
+			if got.IsReadOnly() != c.want.IsReadOnly() {
+				t.Errorf("IsReadOnly = %v, want %v", got.IsReadOnly(), c.want.IsReadOnly())
+			}
+		})
+	}
+}
+
+func TestLibraryFlagRejects(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"no path", "name=Movies,type=movies", "path= is required"},
+		{"unknown field", "path=/m,colour=blue", "unknown library field"},
+		{"bad readonly value", "path=/m,readonly=maybe", "readonly"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var l libraryList
+			err := l.Set(c.in)
+			if err == nil {
+				t.Fatalf("Set(%q) succeeded, want an error", c.in)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error = %q, want it to mention %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestLibraryFlagRepeats(t *testing.T) {
+	var l libraryList
+	if err := l.Set("name=Movies,type=movies,path=/mnt/alberca/Movies"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Set("name=Music,type=music,path=/mnt/alberca/Music"); err != nil {
+		t.Fatal(err)
+	}
+	if len(l) != 2 {
+		t.Fatalf("got %d libraries, want 2", len(l))
+	}
+	if l.String() != "Movies,Music" {
+		t.Errorf("String() = %q", l.String())
+	}
+	got, ok := l.Get().([]Library)
+	if !ok {
+		t.Fatal("Get() did not return []Library")
+	}
+	if len(got) != 2 {
+		t.Errorf("Get() returned %d libraries, want 2", len(got))
+	}
+}
+
+// The flag layer replaces the file's set rather than appending to it, matching
+// how every other setting overrides.
+func TestLibraryFlagOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gofin.json")
+	if err := os.WriteFile(path, []byte(
+		`{"libraries":[{"name":"FromFile","path":"/a","type":"movies"},
+		               {"name":"AlsoFromFile","path":"/b","type":"music"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := newFlagSet()
+	var libs libraryList
+	fs.Var(&libs, "library", "")
+	if err := fs.Parse([]string{"-library", "name=FromFlag,type=movies,path=/c"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := load(fs, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Libraries) != 1 || cfg.Libraries[0].Name != "FromFlag" {
+		t.Errorf("libraries = %+v, want only the flag value", cfg.Libraries)
+	}
+}
+
+// The exact configuration this was built for.
+func TestAlbercaConfiguration(t *testing.T) {
+	fs := newFlagSet()
+	var libs libraryList
+	fs.Var(&libs, "library", "")
+	if err := fs.Parse([]string{
+		"-library", "name=Movies,type=movies,path=/mnt/alberca/Movies,readonly",
+		"-library", "name=Music,type=music,path=/mnt/alberca/Music,readonly",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := load(fs, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Libraries) != 2 {
+		t.Fatalf("got %d libraries, want 2", len(cfg.Libraries))
+	}
+	want := []Library{
+		{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+		{Name: "Music", Path: "/mnt/alberca/Music", Type: "music"},
+	}
+	for i, w := range want {
+		got := cfg.Libraries[i]
+		if got.Name != w.Name || got.Path != w.Path || got.Type != w.Type {
+			t.Errorf("library %d = %+v, want %+v", i, got, w)
+		}
+		if !got.IsReadOnly() {
+			t.Errorf("library %q must be read-only", got.Name)
+		}
+	}
+}
+
+// ------------------------------------------------------------ views + items
+
+// libEnv is a testEnv whose server has the two libraries configured.
+func libEnv(t *testing.T) *testEnv {
+	t.Helper()
+	e := newTestEnv(t)
+	libs, err := normalizeLibraries([]Library{
+		{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"},
+		{Name: "Music", Path: "/mnt/alberca/Music", Type: "music"},
+	}, "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Libraries = libs
+	e.handler = e.srv.routes()
+	return e
+}
+
+// The finding from the Delfin session log: the server emits dashless GUIDs, and
+// the client sends them back DASHED in the path. Both must resolve to the same
+// user or every per-user route 403s against its own token holder.
+func TestUserRoutesAcceptDashedAndDashlessGuids(t *testing.T) {
+	e := libEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	dashless := e.viewer.ID.String()
+	dashed := e.viewer.ID.Dashed()
+	if dashed == dashless {
+		t.Fatal("test is meaningless: the two forms are identical")
+	}
+
+	for _, form := range []struct{ name, id string }{
+		{"dashless (what we emit)", dashless},
+		{"dashed (what Delfin sends back)", dashed},
+	} {
+		t.Run(form.name, func(t *testing.T) {
+			w := e.do(t, "GET", "/Users/"+form.id+"/Views", tok, nil)
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body)
+			}
+			var got QueryResult[BaseItemDto]
+			decodeJSON(t, w, &got)
+			if got.TotalRecordCount != 2 {
+				t.Errorf("TotalRecordCount = %d, want 2", got.TotalRecordCount)
+			}
+		})
+	}
+}
+
+// Both spellings must work: newer clients use /UserViews, Delfin uses the
+// per-user path form.
+func TestUserViewsBothRouteForms(t *testing.T) {
+	e := libEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	for _, path := range []string{
+		"/UserViews",
+		"/UserViews?userId=" + e.viewer.ID.String(),
+		"/Users/" + e.viewer.ID.String() + "/Views",
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := e.do(t, "GET", path, tok, nil)
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var got QueryResult[BaseItemDto]
+			decodeJSON(t, w, &got)
+			if len(got.Items) != 2 {
+				t.Errorf("got %d views, want 2", len(got.Items))
+			}
+		})
+	}
+}
+
+func TestUserViewsContent(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/UserViews", e.tokenFor(e.viewer), nil)
+
+	var got QueryResult[BaseItemDto]
+	decodeJSON(t, w, &got)
+	if len(got.Items) != 2 {
+		t.Fatalf("got %d views, want 2", len(got.Items))
+	}
+
+	movies := got.Items[0]
+	if movies.Name != "Movies" {
+		t.Errorf("Name = %q, want Movies", movies.Name)
+	}
+	if movies.CollectionType != "movies" {
+		t.Errorf("CollectionType = %q, want movies", movies.CollectionType)
+	}
+	if !movies.IsFolder {
+		t.Error("a library view must be a folder")
+	}
+	if movies.Type != "CollectionFolder" {
+		t.Errorf("Type = %q, want CollectionFolder", movies.Type)
+	}
+	if movies.ID.IsZero() {
+		t.Error("view has no Id")
+	}
+	// Clients key per-view UI state on this, so it must be set and stable.
+	if movies.DisplayPreferencesID != movies.ID.String() {
+		t.Errorf("DisplayPreferencesId = %q, want the item id", movies.DisplayPreferencesID)
+	}
+}
+
+// Library IDs must survive a restart, or clients lose per-library state every
+// time the server bounces.
+func TestLibraryIDIsDeterministic(t *testing.T) {
+	l := Library{Name: "Movies", Path: "/mnt/alberca/Movies", Type: "movies"}
+	a := l.ID("/data")
+	b := l.ID("/data")
+	if a != b {
+		t.Errorf("library ID is not stable: %s != %s", a, b)
+	}
+	if a.IsZero() {
+		t.Error("library ID is zero")
+	}
+
+	// The ID follows the library name, not the media path, because upstream
+	// derives it from the virtual-folder directory.
+	renamed := Library{Name: "Films", Path: "/mnt/alberca/Movies", Type: "movies"}
+	if renamed.ID("/data") == a {
+		t.Error("renaming a library should change its ID")
+	}
+	moved := Library{Name: "Movies", Path: "/somewhere/else", Type: "movies"}
+	if moved.ID("/data") != a {
+		t.Error("moving the media path should not change the library ID")
+	}
+}
+
+// Every view must serialize its empty collections as [] and {}, never null:
+// clients iterate them without null checks.
+func TestViewDtoEmptyCollectionsAreNotNull(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/UserViews", e.tokenFor(e.viewer), nil)
+
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"Items"`
+	}
+	decodeJSON(t, w, &raw)
+	if len(raw.Items) == 0 {
+		t.Fatal("no views returned")
+	}
+
+	for _, field := range []string{
+		"BackdropImageTags", "Tags", "Genres", "Studios",
+		"People", "GenreItems", "ExternalUrls", "RemoteTrailers", "LockedFields",
+	} {
+		if got := string(raw.Items[0][field]); got != "[]" {
+			t.Errorf("%s = %s, want []", field, got)
+		}
+	}
+	for _, field := range []string{"ImageTags", "ImageBlurHashes", "ProviderIds"} {
+		if got := string(raw.Items[0][field]); got != "{}" {
+			t.Errorf("%s = %s, want {}", field, got)
+		}
+	}
+}
+
+// With no libraries configured the answer is an empty result, not null and not
+// an error.
+func TestUserViewsWithNoLibraries(t *testing.T) {
+	e := newTestEnv(t)
+	w := e.do(t, "GET", "/UserViews", e.tokenFor(e.viewer), nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var raw map[string]json.RawMessage
+	decodeJSON(t, w, &raw)
+	if got := string(raw["Items"]); got != "[]" {
+		t.Errorf("Items = %s, want []", got)
+	}
+	if got := string(raw["TotalRecordCount"]); got != "0" {
+		t.Errorf("TotalRecordCount = %s, want 0", got)
+	}
+}
+
+func TestUserViewsRequiresAuth(t *testing.T) {
+	e := libEnv(t)
+	if w := e.do(t, "GET", "/UserViews", "", nil); w.Code != 401 {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+// One user may not read another's views; an admin may.
+func TestUserViewsForbidsOtherUsers(t *testing.T) {
+	e := libEnv(t)
+
+	w := e.do(t, "GET", "/Users/"+e.admin.ID.String()+"/Views", e.tokenFor(e.viewer), nil)
+	if w.Code != 403 {
+		t.Errorf("viewer reading the admin's views = %d, want 403", w.Code)
+	}
+
+	w = e.do(t, "GET", "/Users/"+e.viewer.ID.String()+"/Views", e.tokenFor(e.admin), nil)
+	if w.Code != 200 {
+		t.Errorf("admin reading the viewer's views = %d, want 200", w.Code)
+	}
+}
+
+func TestUserViewsRejectsMalformedUserID(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/Users/not-a-guid/Views", e.tokenFor(e.viewer), nil)
+	if w.Code != 403 {
+		t.Errorf("status = %d, want 403", w.Code)
+	}
+}
+
+// The top level of a browse is the library roots, which configuration alone
+// can answer.
+func TestUserItemsTopLevelReturnsLibraries(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/Users/"+e.viewer.ID.String()+"/Items", e.tokenFor(e.viewer), nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var got QueryResult[BaseItemDto]
+	decodeJSON(t, w, &got)
+	if got.TotalRecordCount != 2 {
+		t.Errorf("TotalRecordCount = %d, want 2", got.TotalRecordCount)
+	}
+}
+
+// Below a library the scanner is needed, so the honest answer is an empty
+// result -- an empty library is true, an error dialog would not be.
+func TestUserItemsBelowLibraryIsEmptyNotAnError(t *testing.T) {
+	e := libEnv(t)
+	parent := e.srv.views()[0].ID.String()
+
+	for _, path := range []string{
+		"/Users/" + e.viewer.ID.String() + "/Items?ParentId=" + parent,
+		"/Items?ParentId=" + parent,
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := e.do(t, "GET", path, e.tokenFor(e.viewer), nil)
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var raw map[string]json.RawMessage
+			decodeJSON(t, w, &raw)
+			if got := string(raw["Items"]); got != "[]" {
+				t.Errorf("Items = %s, want []", got)
+			}
+		})
+	}
+}
+
+// ------------------------------------------------- display preferences, avatar
+
+// A client that cannot read its display preferences may stop before rendering
+// anything, so this answers with defaults rather than an error.
+func TestDisplayPreferences(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/DisplayPreferences/usersettings?client=emby", e.tokenFor(e.viewer), nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body)
+	}
+
+	var got DisplayPreferencesDto
+	decodeJSON(t, w, &got)
+	if got.ID != "usersettings" {
+		t.Errorf("Id = %q, want usersettings", got.ID)
+	}
+	if got.Client != "emby" {
+		t.Errorf("Client = %q, want emby", got.Client)
+	}
+	if got.SortBy == "" || got.SortOrder == "" {
+		t.Errorf("defaults are incomplete: %+v", got)
+	}
+
+	// CustomPrefs must be {} rather than null; clients index into it directly.
+	var raw map[string]json.RawMessage
+	decodeJSON(t, w, &raw)
+	if s := string(raw["CustomPrefs"]); s != "{}" {
+		t.Errorf("CustomPrefs = %s, want {}", s)
+	}
+}
+
+// Writes are accepted and dropped. An error here makes some clients retry in a
+// loop.
+func TestDisplayPreferencesWriteIsAccepted(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "POST", "/DisplayPreferences/usersettings", e.tokenFor(e.viewer),
+		strings.NewReader(`{"SortBy":"DateCreated"}`))
+	if w.Code != 204 {
+		t.Errorf("status = %d, want 204", w.Code)
+	}
+}
+
+func TestDisplayPreferencesRequiresAuth(t *testing.T) {
+	e := libEnv(t)
+	if w := e.do(t, "GET", "/DisplayPreferences/usersettings", "", nil); w.Code != 401 {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+// A user with no avatar is a 404 -- what upstream returns, and what makes
+// clients fall back to a generated monogram instead of showing a broken image.
+func TestUserPrimaryImageIs404(t *testing.T) {
+	e := libEnv(t)
+	w := e.do(t, "GET", "/Users/"+e.viewer.ID.String()+"/Images/Primary", "", nil)
+	if w.Code != 404 {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+// The exact request sequence from the Delfin session log, with the dashed
+// GUID it actually sent.
+func TestDelfinSessionSequence(t *testing.T) {
+	e := libEnv(t)
+	tok := e.tokenFor(e.admin)
+	id := e.admin.ID.Dashed()
+
+	for _, c := range []struct {
+		path string
+		want int
+	}{
+		{"/Users/" + id + "/Images/Primary", 404},
+		{"/Users/" + id + "/Views", 200},
+		{"/DisplayPreferences/usersettings", 200},
+		{"/Users/" + id + "/Items", 200},
+	} {
+		t.Run(c.path, func(t *testing.T) {
+			if w := e.do(t, "GET", c.path, tok, nil); w.Code != c.want {
+				t.Errorf("status = %d, want %d", w.Code, c.want)
+			}
+		})
+	}
+}
+
+// ------------------------------------------------------ scanned item browsing
+
+// scannedEnv builds a real media tree on disk, configures it as a library, and
+// scans it -- so these tests exercise the whole path from filesystem to DTO.
+func scannedEnv(t *testing.T) (*testEnv, string) {
+	t.Helper()
+	root := t.TempDir()
+	movies := filepath.Join(root, "Movies")
+	music := filepath.Join(root, "Music")
+
+	for _, p := range []string{
+		filepath.Join(movies, "Arrival (2016).mkv"),
+		filepath.Join(movies, "Dune.2021.1080p.BluRay.x264.mkv"),
+		filepath.Join(movies, "sample.mkv"),
+		filepath.Join(music, "Radiohead", "OK Computer", "01 Airbag.flac"),
+		filepath.Join(music, "Radiohead", "OK Computer", "02 Paranoid Android.flac"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	e := newTestEnv(t)
+	libs, err := normalizeLibraries([]Library{
+		{Name: "Movies", Path: movies, Type: "movies"},
+		{Name: "Music", Path: music, Type: "music"},
+	}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Libraries = libs
+	e.srv.cfg.Paths.Data = filepath.Join(root, "data")
+	e.handler = e.srv.routes()
+
+	e.srv.scanLibraries()
+	return e, root
+}
+
+func TestBrowseScannedMovies(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	// The library view reports how many items it holds.
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+
+	var moviesView BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Movies" {
+			moviesView = v
+		}
+	}
+	if moviesView.ID.IsZero() {
+		t.Fatal("no Movies view")
+	}
+	if moviesView.ChildCount != 2 {
+		t.Errorf("ChildCount = %d, want 2 (the sample must not count)", moviesView.ChildCount)
+	}
+
+	// Browsing into it returns the films.
+	var got QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+moviesView.ID.String(), tok, nil), &got)
+
+	if got.TotalRecordCount != 2 {
+		t.Fatalf("TotalRecordCount = %d, want 2: %+v", got.TotalRecordCount, got.Items)
+	}
+	byName := map[string]BaseItemDto{}
+	for _, it := range got.Items {
+		byName[it.Name] = it
+	}
+	arrival, ok := byName["Arrival"]
+	if !ok {
+		t.Fatalf("no item named Arrival; got %v", got.Items)
+	}
+	if arrival.Type != "Movie" {
+		t.Errorf("Type = %q, want Movie", arrival.Type)
+	}
+	if arrival.MediaType != "Video" {
+		t.Errorf("MediaType = %q, want Video", arrival.MediaType)
+	}
+	if arrival.ProductionYear == nil || *arrival.ProductionYear != 2016 {
+		t.Errorf("ProductionYear = %v, want 2016", arrival.ProductionYear)
+	}
+	if _, ok := byName["Dune"]; !ok {
+		t.Error("the scene-named release should resolve to Dune")
+	}
+}
+
+func TestBrowseScannedMusic(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var musicView BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Music" {
+			musicView = v
+		}
+	}
+	if musicView.ID.IsZero() {
+		t.Fatal("no Music view")
+	}
+
+	// Library -> artist
+	var artists QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+musicView.ID.String(), tok, nil), &artists)
+	if len(artists.Items) != 1 || artists.Items[0].Name != "Radiohead" {
+		t.Fatalf("artists = %+v, want one Radiohead", artists.Items)
+	}
+	if artists.Items[0].Type != "MusicArtist" {
+		t.Errorf("Type = %q, want MusicArtist", artists.Items[0].Type)
+	}
+
+	// Artist -> album
+	var albums QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+artists.Items[0].ID.String(), tok, nil), &albums)
+	if len(albums.Items) != 1 || albums.Items[0].Name != "OK Computer" {
+		t.Fatalf("albums = %+v, want one OK Computer", albums.Items)
+	}
+
+	// Album -> tracks, in disc order
+	var tracks QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+albums.Items[0].ID.String(), tok, nil), &tracks)
+	if len(tracks.Items) != 2 {
+		t.Fatalf("got %d tracks, want 2", len(tracks.Items))
+	}
+	if tracks.Items[0].Name != "Airbag" {
+		t.Errorf("first track = %q, want Airbag", tracks.Items[0].Name)
+	}
+	if tracks.Items[0].MediaType != "Audio" {
+		t.Errorf("MediaType = %q, want Audio", tracks.Items[0].MediaType)
+	}
+	if tracks.Items[0].IndexNumber == nil || *tracks.Items[0].IndexNumber != 1 {
+		t.Errorf("IndexNumber = %v, want 1", tracks.Items[0].IndexNumber)
+	}
+	if tracks.Items[0].Album != "OK Computer" {
+		t.Errorf("Album = %q", tracks.Items[0].Album)
+	}
+}
+
+// An unknown year or duration must render as null, not 0: a client reads year 0
+// as a real year and a zero duration as an unplayable item.
+func TestUnknownYearAndDurationAreNull(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var musicView BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Music" {
+			musicView = v
+		}
+	}
+
+	w := e.do(t, "GET", "/Items?ParentId="+musicView.ID.String(), tok, nil)
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"Items"`
+	}
+	decodeJSON(t, w, &raw)
+	if len(raw.Items) == 0 {
+		t.Fatal("no items")
+	}
+	for _, f := range []string{"ProductionYear", "RunTimeTicks"} {
+		if got := string(raw.Items[0][f]); got != "null" {
+			t.Errorf("%s = %s, want null when unknown", f, got)
+		}
+	}
+}
+
+func TestItemByID(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	lib := views.Items[0]
+
+	// A library root resolves even though it is not in the item store.
+	var got BaseItemDto
+	decodeJSON(t, e.do(t, "GET", "/Items/"+lib.ID.String(), tok, nil), &got)
+	if got.ID != lib.ID {
+		t.Errorf("Id = %s, want %s", got.ID, lib.ID)
+	}
+
+	// A scanned item resolves, in both GUID spellings.
+	var kids QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+lib.ID.String(), tok, nil), &kids)
+	if len(kids.Items) == 0 {
+		t.Fatal("library has no children")
+	}
+	child := kids.Items[0]
+	for _, form := range []string{child.ID.String(), child.ID.Dashed()} {
+		w := e.do(t, "GET", "/Items/"+form, tok, nil)
+		if w.Code != 200 {
+			t.Errorf("GET /Items/%s = %d, want 200", form, w.Code)
+		}
+	}
+}
+
+func TestItemByIDNotFound(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "GET", "/Items/ffffffffffffffffffffffffffffffff", e.tokenFor(e.viewer), nil)
+	if w.Code != 404 {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestItemsRejectsMalformedParentID(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "GET", "/Items?ParentId=not-a-guid", e.tokenFor(e.viewer), nil)
+	if w.Code != 400 {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+// Paging must not lie about the total, or the client sizes its scrollbar wrong.
+func TestItemPaging(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var moviesView BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Movies" {
+			moviesView = v
+		}
+	}
+
+	var got QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET",
+		"/Items?ParentId="+moviesView.ID.String()+"&Limit=1", tok, nil), &got)
+	if len(got.Items) != 1 {
+		t.Errorf("got %d items, want 1", len(got.Items))
+	}
+	if got.TotalRecordCount != 2 {
+		t.Errorf("TotalRecordCount = %d, want the full 2", got.TotalRecordCount)
+	}
+
+	decodeJSON(t, e.do(t, "GET",
+		"/Items?ParentId="+moviesView.ID.String()+"&StartIndex=1", tok, nil), &got)
+	if len(got.Items) != 1 {
+		t.Errorf("got %d items after StartIndex=1, want 1", len(got.Items))
+	}
+	if got.StartIndex != 1 {
+		t.Errorf("StartIndex = %d, want 1", got.StartIndex)
+	}
+
+	// Past the end is an empty page, not an error and not null.
+	decodeJSON(t, e.do(t, "GET",
+		"/Items?ParentId="+moviesView.ID.String()+"&StartIndex=99", tok, nil), &got)
+	if len(got.Items) != 0 {
+		t.Errorf("got %d items past the end, want 0", len(got.Items))
+	}
+}
+
+// A rescan must not change item IDs, or every scan invalidates client caches.
+func TestRescanIsStable(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var before QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &before)
+	lib := before.Items[0].ID
+
+	var a QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+lib.String(), tok, nil), &a)
+
+	e.srv.scanLibraries()
+
+	var b QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+lib.String(), tok, nil), &b)
+
+	if len(a.Items) != len(b.Items) {
+		t.Fatalf("item count changed across a rescan: %d -> %d", len(a.Items), len(b.Items))
+	}
+	for i := range a.Items {
+		if a.Items[i].ID != b.Items[i].ID {
+			t.Errorf("item %d changed ID across a rescan: %s -> %s",
+				i, a.Items[i].ID, b.Items[i].ID)
+		}
+	}
+}
+
+func TestLibraryRefreshRequiresAdmin(t *testing.T) {
+	e, _ := scannedEnv(t)
+	if w := e.do(t, "POST", "/Library/Refresh", e.tokenFor(e.viewer), nil); w.Code != 403 {
+		t.Errorf("non-admin = %d, want 403", w.Code)
+	}
+	if w := e.do(t, "POST", "/Library/Refresh", e.tokenFor(e.admin), nil); w.Code != 204 {
+		t.Errorf("admin = %d, want 204", w.Code)
+	}
+}
+
+// The item store is swapped in wholesale, so a concurrent read during a rescan
+// sees either the old set or the new one, never a half-populated library.
+func TestConcurrentBrowseDuringRescan(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			e.srv.scanLibraries()
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		if w := e.do(t, "GET", "/UserViews", tok, nil); w.Code != 200 {
+			t.Errorf("browse during rescan = %d", w.Code)
+			break
+		}
+	}
+	<-done
+}
+
+// ------------------------------------------- literal routes under /Items/
+
+// A real client asked for /Users/{id}/Items/Latest and got 400: the {itemId}
+// wildcard swallowed it and tried to parse "Latest" as a GUID. Each literal
+// segment under /Items/ has to be registered or it breaks a real endpoint.
+func TestItemsLiteralRoutesAreNotParsedAsIDs(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+	uid := e.viewer.ID.Dashed() // the dashed form a client actually sends
+
+	for _, path := range []string{
+		"/Users/" + uid + "/Items/Latest",
+		"/Users/" + uid + "/Items/Resume",
+		"/Users/" + uid + "/Items/Root",
+		"/Items/Latest",
+		"/Items/Resume",
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := e.do(t, "GET", path, tok, nil)
+			if w.Code == 400 {
+				t.Fatalf("status = 400: %q was parsed as an item id", path)
+			}
+			if w.Code != 200 {
+				t.Errorf("status = %d, want 200", w.Code)
+			}
+		})
+	}
+}
+
+// Latest returns a BARE ARRAY, not a QueryResult. A client handed
+// {"Items":[...]} here renders an empty row.
+func TestLatestItemsIsABareArray(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "GET", "/Items/Latest", e.tokenFor(e.viewer), nil)
+
+	body := strings.TrimSpace(w.Body.String())
+	if !strings.HasPrefix(body, "[") {
+		t.Fatalf("Latest returned %.60s..., want a bare JSON array", body)
+	}
+	var items []BaseItemDto
+	decodeJSON(t, w, &items)
+	if len(items) == 0 {
+		t.Error("Latest returned nothing from a scanned library")
+	}
+	// Folders are not "recently added media".
+	for _, it := range items {
+		if it.IsFolder {
+			t.Errorf("Latest included the folder %q", it.Name)
+		}
+	}
+}
+
+// Latest is newest-first, and scoping it to a library must reach media nested
+// below it -- music tracks are two levels down.
+func TestLatestItemsOrderingAndScope(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var music BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Music" {
+			music = v
+		}
+	}
+
+	var items []BaseItemDto
+	decodeJSON(t, e.do(t, "GET", "/Items/Latest?ParentId="+music.ID.String(), tok, nil), &items)
+	if len(items) == 0 {
+		t.Fatal("scoping Latest to the music library found nothing; it must descend past artist and album")
+	}
+	for _, it := range items {
+		if it.Type != "Audio" {
+			t.Errorf("got a %s in the music library's Latest", it.Type)
+		}
+	}
+}
+
+func TestLatestRespectsLimit(t *testing.T) {
+	e, _ := scannedEnv(t)
+	var items []BaseItemDto
+	decodeJSON(t, e.do(t, "GET", "/Items/Latest?Limit=1", e.tokenFor(e.viewer), nil), &items)
+	if len(items) != 1 {
+		t.Errorf("got %d items, want 1", len(items))
+	}
+}
+
+// Resume needs playback state, which nothing records. Empty is truthful and
+// keeps "Continue Watching" from erroring.
+func TestResumeIsEmptyNotAnError(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "GET", "/Items/Resume", e.tokenFor(e.viewer), nil)
+	var raw map[string]json.RawMessage
+	decodeJSON(t, w, &raw)
+	if got := string(raw["Items"]); got != "[]" {
+		t.Errorf("Items = %s, want []", got)
+	}
+}
+
+// ------------------------------------------------------------------ artwork
+
+// scannedEnvWithArt is scannedEnv plus a conventional poster beside one film.
+func scannedEnvWithArt(t *testing.T) (*testEnv, string) {
+	t.Helper()
+	e, root := scannedEnv(t)
+	poster := filepath.Join(root, "Movies", "poster.jpg")
+	if err := os.WriteFile(poster, []byte("\xff\xd8\xff\xe0JPEGDATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.srv.scanLibraries()
+	return e, root
+}
+
+// An item with no local artwork must answer 404, not 501: a client reads 404 as
+// "draw a placeholder" and stops, while 501 reads as a broken server and gets
+// retried on every render.
+func TestMissingArtworkIs404NotUnimplemented(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var kids QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+views.Items[0].ID.String(), tok, nil), &kids)
+	if len(kids.Items) == 0 {
+		t.Fatal("no items")
+	}
+
+	w := e.do(t, "GET", "/Items/"+kids.Items[0].ID.String()+"/Images/Primary", "", nil)
+	if w.Code != 404 {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+// Image URLs go into <img> tags, which cannot set an Authorization header.
+func TestArtworkNeedsNoToken(t *testing.T) {
+	e, _ := scannedEnvWithArt(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var movies BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Movies" {
+			movies = v
+		}
+	}
+	var kids QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+movies.ID.String(), tok, nil), &kids)
+
+	var withArt *BaseItemDto
+	for i := range kids.Items {
+		if kids.Items[i].ImageTags["Primary"] != "" {
+			withArt = &kids.Items[i]
+		}
+	}
+	if withArt == nil {
+		t.Fatal("no item advertised a Primary image tag")
+	}
+
+	// No Authorization header at all.
+	w := e.do(t, "GET", "/Items/"+withArt.ID.String()+"/Images/Primary", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; artwork must not require a token", w.Code)
+	}
+	if !strings.HasPrefix(w.Body.String(), "\xff\xd8\xff") {
+		t.Error("body is not the JPEG that was written")
+	}
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "max-age") {
+		t.Errorf("Cache-Control = %q, want a long max-age on immutable artwork", cc)
+	}
+	if w.Header().Get("ETag") == "" {
+		t.Error("no ETag on artwork")
+	}
+}
+
+// An item with no artwork must not advertise a Primary tag, or every poster
+// slot fires a request that can only 404.
+func TestImageTagsOnlyWhenArtworkExists(t *testing.T) {
+	e, _ := scannedEnv(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var kids QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+views.Items[0].ID.String(), tok, nil), &kids)
+
+	for _, it := range kids.Items {
+		if it.ImageTags["Primary"] != "" {
+			t.Errorf("%q advertises artwork it does not have", it.Name)
+		}
+	}
+}
+
+func TestNonPrimaryImageTypeIs404(t *testing.T) {
+	e, _ := scannedEnvWithArt(t)
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", e.tokenFor(e.viewer), nil), &views)
+
+	for _, typ := range []string{"Backdrop", "Logo", "Thumb"} {
+		w := e.do(t, "GET", "/Items/"+views.Items[0].ID.String()+"/Images/"+typ, "", nil)
+		if w.Code != 404 {
+			t.Errorf("%s = %d, want 404", typ, w.Code)
+		}
+	}
+}
+
+func TestImageRejectsMalformedID(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "GET", "/Items/not-a-guid/Images/Primary", "", nil)
+	if w.Code != 400 {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+// ---------------------------------------------------------- artwork fetching
+
+// tmdbEnv is a scanned library wired to a fake TMDB, so nothing touches the
+// network.
+func tmdbEnv(t *testing.T, handler http.HandlerFunc) (*testEnv, *httptest.Server) {
+	t.Helper()
+	e, root := scannedEnv(t)
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	c := jftmdb.New("test-key")
+	c.APIBase = srv.URL
+	c.ImageBase = srv.URL + "/img"
+	c.MinInterval = 0
+	e.srv.tmdb = c
+	e.srv.cfg.Paths.Cache = filepath.Join(root, "cache")
+	return e, srv
+}
+
+const tmdbHit = `{"results":[{"id":1,"title":"Arrival","release_date":"2016-11-10","poster_path":"/p.jpg"}]}`
+
+func TestFetchArtworkDownloadsPosters(t *testing.T) {
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/img/") {
+			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			return
+		}
+		w.Write([]byte(tmdbHit))
+	})
+
+	e.srv.fetchArtwork()
+
+	// Both scanned films should now have a cached poster.
+	var withArt int
+	for _, it := range e.srv.items.All() {
+		if it.Kind == jfscan.KindMovie && it.PrimaryImage != "" {
+			withArt++
+		}
+	}
+	if withArt != 2 {
+		t.Errorf("%d movies have artwork, want 2", withArt)
+	}
+}
+
+// Posters must land in the cache, never beside the media: a library declared
+// readonly has to stay untouched.
+func TestFetchArtworkNeverWritesToTheMediaDirectory(t *testing.T) {
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/img/") {
+			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			return
+		}
+		w.Write([]byte(tmdbHit))
+	})
+
+	moviesDir := e.srv.cfg.Libraries[0].Path
+	before := listTree(t, moviesDir)
+
+	e.srv.fetchArtwork()
+
+	if after := listTree(t, moviesDir); len(after) != len(before) {
+		t.Errorf("the media directory gained files: %v -> %v", before, after)
+	}
+	// And the cache did gain them.
+	if n := len(listTree(t, e.srv.posterDir())); n == 0 {
+		t.Error("no posters were written to the cache directory")
+	}
+}
+
+// An unmatched title gets a marker so the next restart does not ask again -- a
+// library of scene releases has plenty of these.
+func TestFetchArtworkRecordsMisses(t *testing.T) {
+	var searches int32
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&searches, 1)
+		w.Write([]byte(`{"results":[]}`))
+	})
+
+	e.srv.fetchArtwork()
+	first := atomic.LoadInt32(&searches)
+	if first == 0 {
+		t.Fatal("no searches were made")
+	}
+
+	// A second run must not re-query what already missed.
+	e.srv.fetchArtwork()
+	if got := atomic.LoadInt32(&searches); got != first {
+		t.Errorf("made %d more searches on the second run; misses should be remembered", got-first)
+	}
+}
+
+// Clearing the markers is what makes a retry meaningful after renaming files.
+func TestRefreshArtworkRetryMissed(t *testing.T) {
+	var searches int32
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&searches, 1)
+		w.Write([]byte(`{"results":[]}`))
+	})
+
+	e.srv.fetchArtwork()
+	first := atomic.LoadInt32(&searches)
+
+	e.srv.clearArtworkMisses()
+	e.srv.fetchArtwork()
+	if got := atomic.LoadInt32(&searches); got <= first {
+		t.Error("clearing the misses should cause a fresh lookup")
+	}
+}
+
+// A rejected key fails identically for every remaining item, so the run stops
+// rather than sending one doomed request per film.
+func TestFetchArtworkStopsOnRejectedKey(t *testing.T) {
+	var calls int32
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+
+	e.srv.fetchArtwork()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("made %d calls after a 401, want 1 -- the run should stop", got)
+	}
+}
+
+func TestFetchArtworkStopsOnRateLimit(t *testing.T) {
+	var calls int32
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	e.srv.fetchArtwork()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("made %d calls after a 429, want 1", got)
+	}
+}
+
+// Music is not looked up: TMDB is a movie database.
+func TestFetchArtworkSkipsNonMovies(t *testing.T) {
+	var queries []string
+	var mu sync.Mutex
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query().Get("query"); q != "" {
+			mu.Lock()
+			queries = append(queries, q)
+			mu.Unlock()
+		}
+		w.Write([]byte(`{"results":[]}`))
+	})
+
+	e.srv.fetchArtwork()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, q := range queries {
+		if q == "Airbag" || q == "Paranoid Android" || q == "Radiohead" {
+			t.Errorf("looked up the music item %q against a movie database", q)
+		}
+	}
+}
+
+// A cached poster is adopted at scan time, so a restart shows artwork
+// immediately instead of waiting on the network. This is the first thing gofin
+// persists across restarts.
+func TestCachedPosterSurvivesRescan(t *testing.T) {
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/img/") {
+			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			return
+		}
+		w.Write([]byte(tmdbHit))
+	})
+
+	e.srv.fetchArtwork()
+
+	// Drop the provider entirely, then rescan: the posters must still be there.
+	e.srv.tmdb = nil
+	e.srv.scanLibraries()
+
+	var withArt int
+	for _, it := range e.srv.items.All() {
+		if it.Kind == jfscan.KindMovie && it.PrimaryImage != "" {
+			withArt++
+		}
+	}
+	if withArt != 2 {
+		t.Errorf("%d movies kept artwork across a rescan with no provider, want 2", withArt)
+	}
+}
+
+// A fetched poster must be servable and advertised, end to end.
+func TestFetchedPosterIsServed(t *testing.T) {
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/img/") {
+			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			return
+		}
+		w.Write([]byte(tmdbHit))
+	})
+	e.srv.fetchArtwork()
+
+	tok := e.tokenFor(e.viewer)
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var movies BaseItemDto
+	for _, v := range views.Items {
+		if v.Name == "Movies" {
+			movies = v
+		}
+	}
+	var kids QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+movies.ID.String(), tok, nil), &kids)
+
+	if len(kids.Items) == 0 {
+		t.Fatal("no items")
+	}
+	it := kids.Items[0]
+	if it.ImageTags["Primary"] == "" {
+		t.Fatal("a fetched poster was not advertised in ImageTags")
+	}
+	w := e.do(t, "GET", "/Items/"+it.ID.String()+"/Images/Primary", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("serving the fetched poster = %d, want 200", w.Code)
+	}
+	if !strings.HasPrefix(w.Body.String(), "\xff\xd8\xff") {
+		t.Error("served body is not the JPEG that was downloaded")
+	}
+}
+
+// With no provider configured the endpoint says so rather than pretending.
+func TestRefreshArtworkWithoutProvider(t *testing.T) {
+	e, _ := scannedEnv(t)
+	w := e.do(t, "POST", "/Library/RefreshArtwork", e.tokenFor(e.admin), nil)
+	if w.Code != 503 {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestRefreshArtworkRequiresAdmin(t *testing.T) {
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":[]}`))
+	})
+	if w := e.do(t, "POST", "/Library/RefreshArtwork", e.tokenFor(e.viewer), nil); w.Code != 403 {
+		t.Errorf("non-admin = %d, want 403", w.Code)
+	}
+}
+
+// Two concurrent fetches must not both run: the second would re-request
+// everything the first is already downloading.
+func TestFetchArtworkDoesNotRunTwice(t *testing.T) {
+	release := make(chan struct{})
+	var calls int32
+	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		w.Write([]byte(`{"results":[]}`))
+	})
+
+	done := make(chan struct{})
+	go func() { e.srv.fetchArtwork(); close(done) }()
+
+	// Wait for the first run to be in flight, then try to start another.
+	for i := 0; i < 100 && atomic.LoadInt32(&calls) == 0; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	e.srv.fetchArtwork() // must return immediately
+	close(release)
+	<-done
+}
+
+// The provider must be off unless it is both enabled and given a key.
+func TestTMDBRequiresBothEnabledAndKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled bool
+		key     string
+		want    bool
+	}{
+		{"off by default", false, "", false},
+		{"enabled without a key", true, "", false},
+		{"key without enabling", false, "k", false},
+		{"both", true, "k", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := c.enabled && c.key != ""
+			if got != c.want {
+				t.Errorf("enabled=%v key=%q -> %v, want %v", c.enabled, c.key, got, c.want)
+			}
+		})
+	}
+}
+
+func listTree(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
+		if err != nil || fi.IsDir() {
+			return nil
+		}
+		out = append(out, p)
+		return nil
+	})
+	return out
 }

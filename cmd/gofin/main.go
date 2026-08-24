@@ -25,17 +25,24 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"gofin/internal/jfauth"
 	"gofin/internal/jfid"
+	"gofin/internal/jfprobe"
+	"gofin/internal/jfscan"
+	"gofin/internal/jftime"
+	"gofin/internal/jftmdb"
 	"gofin/internal/jfws"
 )
 
@@ -73,7 +80,16 @@ type Config struct {
 		Level  string `json:"level"`
 		Format string `json:"format"`
 	} `json:"logging"`
-	Users []ConfigUser `json:"users"`
+	Metadata struct {
+		TMDB struct {
+			Enabled    bool   `json:"enabled"`
+			APIKey     string `json:"api_key"`
+			Language   string `json:"language"`
+			PosterSize string `json:"poster_size"`
+		} `json:"tmdb"`
+	} `json:"metadata"`
+	Users     []ConfigUser `json:"users"`
+	Libraries []Library    `json:"libraries"`
 }
 
 type ConfigUser struct {
@@ -81,6 +97,44 @@ type ConfigUser struct {
 	PasswordHash string `json:"password_hash"`
 	Password     string `json:"password"` // convenience for bootstrap; hashed on load
 	Admin        bool   `json:"admin"`
+}
+
+// Library is one media root. It corresponds to a Jellyfin "virtual folder":
+// Name is what the client shows, Type is the CollectionType that decides which
+// metadata providers and item kinds apply.
+//
+// Upstream allows several locations per virtual folder. One path per library is
+// the simplification here; adding a second field later is easier than taking a
+// list away, and nothing in the scanner design depends on it being singular.
+type Library struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Type string `json:"type"`
+
+	// ReadOnly is a pointer so that "unset" is distinguishable from "false".
+	// The zero value of a bool is false, which would make an omitted field mean
+	// *writable* -- the dangerous direction. Unset means read-only; making a
+	// library writable has to be deliberate. Use IsReadOnly, not this field.
+	ReadOnly *bool `json:"readonly"`
+}
+
+// IsReadOnly reports the effective setting, defaulting to true when unset.
+func (l Library) IsReadOnly() bool { return l.ReadOnly == nil || *l.ReadOnly }
+
+// collectionTypes are the CollectionType values a user-created library may
+// carry. Upstream has more (playlists, livetv, folders), but those are server-
+// managed rather than pointed at a directory. The empty string means "mixed
+// content", which upstream also permits.
+var collectionTypes = map[string]bool{
+	"":            true, // mixed content
+	"movies":      true,
+	"tvshows":     true,
+	"music":       true,
+	"musicvideos": true,
+	"homevideos":  true,
+	"boxsets":     true,
+	"books":       true,
+	"mixed":       true,
 }
 
 func defaultConfig() *Config {
@@ -96,6 +150,8 @@ func defaultConfig() *Config {
 	c.Paths.Logs = "./logs"
 	c.Logging.Level = "info"
 	c.Logging.Format = "text"
+	c.Metadata.TMDB.Language = jftmdb.DefaultLanguage
+	c.Metadata.TMDB.PosterSize = jftmdb.DefaultPosterSize
 	return &c
 }
 
@@ -140,6 +196,22 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 	if v := os.Getenv("JELLYFIN_PublishedServerUrl"); v != "" {
 		cfg.Server.PublishedURL = v
 	}
+	// Libraries come through the environment as the same JSON the config file
+	// uses. A bespoke mini-syntax here would be a second thing to get right for
+	// no benefit, and container users are already writing JSON.
+	// An API key is a credential; letting it come from the environment keeps it
+	// out of a config file that gets copied around.
+	if v := os.Getenv("GOFIN_TMDB_API_KEY"); v != "" {
+		cfg.Metadata.TMDB.APIKey = v
+		cfg.Metadata.TMDB.Enabled = true
+	}
+	if v := os.Getenv("GOFIN_LIBRARIES"); v != "" {
+		var libs []Library
+		if err := json.Unmarshal([]byte(v), &libs); err != nil {
+			return nil, fmt.Errorf("parsing GOFIN_LIBRARIES: %w", err)
+		}
+		cfg.Libraries = libs
+	}
 
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -160,6 +232,15 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 			cfg.Logging.Level = f.Value.String()
 		case "log-format":
 			cfg.Logging.Format = f.Value.String()
+		case "library":
+			// Repeating -library replaces the configured set rather than
+			// appending to it, so the flag layer overrides the file layer the
+			// same way every other setting does.
+			if g, ok := f.Value.(flag.Getter); ok {
+				if libs, ok := g.Get().([]Library); ok {
+					cfg.Libraries = libs
+				}
+			}
 		}
 	})
 
@@ -167,7 +248,198 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 	if cfg.Server.BaseURL != "" && !strings.HasPrefix(cfg.Server.BaseURL, "/") {
 		cfg.Server.BaseURL = "/" + cfg.Server.BaseURL
 	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("resolving the working directory: %w", err)
+	}
+	libs, err := normalizeLibraries(cfg.Libraries, wd)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Libraries = libs
+
 	return cfg, nil
+}
+
+// libraryList collects repeated -library flags. Each occurrence is a
+// comma-separated key=value list, which keeps the meaning of every part
+// explicit instead of relying on positional order:
+//
+//	-library 'name=Movies,type=movies,path=/mnt/alberca/Movies,readonly'
+//
+// A path containing a comma cannot be expressed this way; use the config file
+// for that.
+type libraryList []Library
+
+func (l *libraryList) String() string {
+	names := make([]string, 0, len(*l))
+	for _, lib := range *l {
+		names = append(names, lib.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+// Get lets load pull the parsed value back out through flag.Getter, rather than
+// round-tripping it through String.
+func (l *libraryList) Get() any { return []Library(*l) }
+
+func (l *libraryList) Set(s string) error {
+	var lib Library
+	for _, field := range strings.Split(s, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		key, val, hasVal := strings.Cut(field, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		val = strings.TrimSpace(val)
+
+		switch key {
+		case "name":
+			lib.Name = val
+		case "path":
+			lib.Path = val
+		case "type":
+			lib.Type = val
+		case "readonly", "ro":
+			// Bare "readonly" means true; "readonly=false" opts out.
+			ro := true
+			if hasVal {
+				b, err := strconv.ParseBool(val)
+				if err != nil {
+					return fmt.Errorf("readonly: %w", err)
+				}
+				ro = b
+			}
+			lib.ReadOnly = &ro
+		case "writable", "rw":
+			ro := false
+			lib.ReadOnly = &ro
+		default:
+			return fmt.Errorf("unknown library field %q (want name, path, type, readonly)", key)
+		}
+	}
+	if lib.Path == "" {
+		return fmt.Errorf("library %q: path= is required", s)
+	}
+	*l = append(*l, lib)
+	return nil
+}
+
+// normalizeLibraries cleans and checks the library list without touching the
+// filesystem, so it stays cheap and testable. Anything that needs to stat a
+// path lives in validateLibraryPaths instead.
+//
+// wd is the working directory relative paths resolve against.
+func normalizeLibraries(libs []Library, wd string) ([]Library, error) {
+	out := make([]Library, 0, len(libs))
+	byName := map[string]int{}
+	byPath := map[string]int{}
+
+	for i, l := range libs {
+		l.Name = strings.TrimSpace(l.Name)
+		l.Type = strings.ToLower(strings.TrimSpace(l.Type))
+		l.Path = strings.TrimSpace(l.Path)
+
+		if l.Path == "" {
+			return nil, fmt.Errorf("library %d (%q): path is required", i, l.Name)
+		}
+		// An absolute, symlink-free-ish path makes the ID derivation stable and
+		// the overlap check below meaningful.
+		l.Path = filepath.Clean(abs(l.Path, wd))
+
+		// A missing name defaults to the directory name, which is what a user
+		// almost always wants and what upstream's "add library" dialog suggests.
+		if l.Name == "" {
+			l.Name = filepath.Base(l.Path)
+		}
+		if !collectionTypes[l.Type] {
+			return nil, fmt.Errorf("library %q: unknown type %q (valid: %s)",
+				l.Name, l.Type, strings.Join(sortedCollectionTypes(), ", "))
+		}
+
+		// Names are the client-visible identity and are matched
+		// case-insensitively, so two libraries cannot share one.
+		key := strings.ToLower(l.Name)
+		if prev, dup := byName[key]; dup {
+			return nil, fmt.Errorf("library %q: duplicate name (already used by library %d)", l.Name, prev)
+		}
+		byName[key] = i
+
+		if prev, dup := byPath[l.Path]; dup {
+			return nil, fmt.Errorf("library %q: path %s is already used by library %d", l.Name, l.Path, prev)
+		}
+		byPath[l.Path] = i
+
+		// Nesting one library inside another makes every item in the overlap
+		// resolve twice, under two different parents and two different IDs.
+		for _, o := range out {
+			if pathContains(o.Path, l.Path) || pathContains(l.Path, o.Path) {
+				return nil, fmt.Errorf("library %q (%s) overlaps library %q (%s); "+
+					"one media root may not contain another", l.Name, l.Path, o.Name, o.Path)
+			}
+		}
+
+		// Pin the effective value so `--dry-run` and the startup log show what
+		// is actually in force rather than a null.
+		ro := l.IsReadOnly()
+		l.ReadOnly = &ro
+
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+// pathContains reports whether child is parent or lies beneath it, comparing
+// whole path elements so /a/bc is not treated as living inside /a/b.
+func pathContains(parent, child string) bool {
+	if parent == child {
+		return true
+	}
+	return strings.HasPrefix(child, strings.TrimSuffix(parent, string(filepath.Separator))+string(filepath.Separator))
+}
+
+func sortedCollectionTypes() []string {
+	out := make([]string, 0, len(collectionTypes))
+	for t := range collectionTypes {
+		if t == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// validateLibraryPaths does the filesystem checks: the path must exist, be a
+// directory, and actually be readable by this process.
+//
+// Failing at startup is the point. A library that is unreadable because a mount
+// is not up yet, or because the service user lacks permission, otherwise shows
+// up as a silently empty library after a scan that appeared to succeed.
+func validateLibraryPaths(libs []Library) error {
+	for _, l := range libs {
+		fi, err := os.Stat(l.Path)
+		if err != nil {
+			return fmt.Errorf("library %q: %w", l.Name, err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("library %q: %s is not a directory", l.Name, l.Path)
+		}
+		// Stat succeeding does not mean the directory can be listed; the
+		// execute/read bits are separate.
+		f, err := os.Open(l.Path)
+		if err != nil {
+			return fmt.Errorf("library %q: cannot read %s: %w", l.Name, l.Path, err)
+		}
+		_, err = f.ReadDir(1)
+		f.Close()
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("library %q: cannot list %s: %w", l.Name, l.Path, err)
+		}
+	}
+	return nil
 }
 
 func defaultConfigPath() string {
@@ -336,6 +608,313 @@ func (s *Store) Lookup(token string) (*Token, *User) {
 	return t, s.users[t.UserID]
 }
 
+// ---------------------------------------------------------------- items
+
+// ItemStore is the in-memory item repository. Like Store it is the phase-1
+// stand-in for SQLite, and it is replaced wholesale at the end of a scan so a
+// rescan is atomic: clients never observe a half-populated library.
+type ItemStore struct {
+	mu       sync.RWMutex
+	byID     map[jfid.GUID]jfscan.Item
+	byParent map[jfid.GUID][]jfid.GUID
+	scanning bool
+	lastScan time.Time
+}
+
+func NewItemStore() *ItemStore {
+	return &ItemStore{
+		byID:     map[jfid.GUID]jfscan.Item{},
+		byParent: map[jfid.GUID][]jfid.GUID{},
+	}
+}
+
+// Replace swaps in a freshly scanned set of items.
+func (s *ItemStore) Replace(items []jfscan.Item) {
+	byID := make(map[jfid.GUID]jfscan.Item, len(items))
+	byParent := map[jfid.GUID][]jfid.GUID{}
+	for _, it := range items {
+		byID[it.ID] = it
+		byParent[it.ParentID] = append(byParent[it.ParentID], it.ID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byID = byID
+	s.byParent = byParent
+	s.lastScan = time.Now()
+}
+
+func (s *ItemStore) Get(id jfid.GUID) (jfscan.Item, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	it, ok := s.byID[id]
+	return it, ok
+}
+
+// Children returns the items directly under parent, in the order the scan
+// produced -- which is already sorted.
+func (s *ItemStore) Children(parent jfid.GUID) []jfscan.Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := s.byParent[parent]
+	out := make([]jfscan.Item, 0, len(ids))
+	for _, id := range ids {
+		if it, ok := s.byID[id]; ok {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func (s *ItemStore) ChildCount(parent jfid.GUID) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.byParent[parent])
+}
+
+// All returns every item.
+func (s *ItemStore) All() []jfscan.Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]jfscan.Item, 0, len(s.byID))
+	for _, it := range s.byID {
+		out = append(out, it)
+	}
+	return out
+}
+
+// Descendants returns everything beneath parent, at any depth. "Recently added"
+// for a music library has to reach the tracks, which sit two levels down.
+func (s *ItemStore) Descendants(parent jfid.GUID) []jfscan.Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []jfscan.Item
+	seen := map[jfid.GUID]bool{}
+	queue := []jfid.GUID{parent}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if seen[cur] {
+			continue
+		}
+		seen[cur] = true
+		for _, id := range s.byParent[cur] {
+			if it, ok := s.byID[id]; ok {
+				out = append(out, it)
+				queue = append(queue, id)
+			}
+		}
+	}
+	return out
+}
+
+func (s *ItemStore) Total() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.byID)
+}
+
+func (s *ItemStore) setScanning(v bool) {
+	s.mu.Lock()
+	s.scanning = v
+	s.mu.Unlock()
+}
+
+func (s *ItemStore) Scanning() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scanning
+}
+
+// scanLibraries walks every configured library and replaces the item store.
+//
+// It runs in the background: a large library takes long enough that doing it
+// before the listener opens would look like a server that fails to start, and
+// upstream treats a library scan as a background task for the same reason.
+func (s *Server) scanLibraries() {
+	if s.items.Scanning() {
+		s.log.Warn("scan already in progress; ignoring the request")
+		return
+	}
+	s.items.setScanning(true)
+	defer s.items.setScanning(false)
+
+	start := time.Now()
+	s.log.Info("library scan started", "libraries", len(s.cfg.Libraries))
+
+	var all []jfscan.Item
+	for _, l := range s.cfg.Libraries {
+		res, err := jfscan.Scan(jfscan.Options{
+			Root:           l.Path,
+			CollectionType: l.Type,
+			ParentID:       l.ID(s.cfg.Paths.Data),
+		})
+		if err != nil {
+			s.log.Error("library scan failed", "library", l.Name, "path", l.Path, "err", err)
+			continue
+		}
+		for _, e := range res.Errors {
+			s.log.Warn("unreadable directory during scan", "library", l.Name, "err", e)
+		}
+		s.log.Info("library scanned", "library", l.Name,
+			"items", len(res.Items), "errors", len(res.Errors), "took", res.Duration)
+		all = append(all, res.Items...)
+	}
+
+	// Adopt any poster already in the cache before publishing the items, so a
+	// restart shows artwork immediately instead of waiting on the network.
+	for i := range all {
+		if all[i].PrimaryImage == "" {
+			if p := s.cachedPoster(all[i].ID); p != "" {
+				all[i].PrimaryImage = p
+			}
+		}
+	}
+
+	s.items.Replace(all)
+	s.log.Info("library scan complete", "items", len(all), "took", time.Since(start))
+
+	if s.tmdb != nil {
+		go s.fetchArtwork()
+	}
+}
+
+// posterDir is where downloaded artwork lives.
+//
+// It is under the CACHE directory, never beside the media. A library declared
+// readonly must stay untouched, and artwork is derived data that can always be
+// fetched again -- deleting this directory costs nothing but bandwidth.
+func (s *Server) posterDir() string {
+	return filepath.Join(s.cfg.Paths.Cache, "images")
+}
+
+func (s *Server) posterPath(id jfid.GUID) string {
+	return filepath.Join(s.posterDir(), id.String()+".jpg")
+}
+
+// missPath marks a title TMDB could not match.
+//
+// Without it every restart re-queries the network for the same unmatchable
+// files -- and a library of scene releases has plenty. The marker is a plain
+// empty file so clearing the cache clears the misses too.
+func (s *Server) missPath(id jfid.GUID) string {
+	return filepath.Join(s.posterDir(), id.String()+".miss")
+}
+
+func (s *Server) cachedPoster(id jfid.GUID) string {
+	p := s.posterPath(id)
+	if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
+		return p
+	}
+	return ""
+}
+
+// clearArtworkMisses forgets which titles TMDB could not match, so they are
+// looked up again -- the point of doing so is usually that the files have been
+// renamed since.
+func (s *Server) clearArtworkMisses() {
+	entries, err := os.ReadDir(s.posterDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".miss") {
+			_ = os.Remove(filepath.Join(s.posterDir(), e.Name()))
+		}
+	}
+}
+
+// fetchArtwork downloads posters for items that have none locally.
+//
+// It runs in the background after a scan and is deliberately unhurried: the
+// client already works without artwork, so there is nothing to be gained by
+// hammering the API and something to lose if the key gets rate-limited.
+func (s *Server) fetchArtwork() {
+	if s.tmdb == nil {
+		return
+	}
+	if !s.artworkRunning.CompareAndSwap(false, true) {
+		s.log.Debug("artwork fetch already running")
+		return
+	}
+	defer s.artworkRunning.Store(false)
+
+	if err := os.MkdirAll(s.posterDir(), 0o755); err != nil {
+		s.log.Error("cannot create the poster cache", "path", s.posterDir(), "err", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var want []jfscan.Item
+	for _, it := range s.items.All() {
+		// Only films are looked up: TMDB is a movie database, and music would
+		// need MusicBrainz instead.
+		if it.Kind != jfscan.KindMovie || it.PrimaryImage != "" {
+			continue
+		}
+		if _, err := os.Stat(s.missPath(it.ID)); err == nil {
+			continue // already known to be unmatchable
+		}
+		want = append(want, it)
+	}
+	if len(want) == 0 {
+		return
+	}
+
+	s.log.Info("fetching artwork", "items", len(want), "provider", "tmdb")
+	start := time.Now()
+	var got, missed, failed int
+
+	for _, it := range want {
+		m, err := s.tmdb.SearchMovie(ctx, it.Name, it.Year)
+		switch {
+		case errors.Is(err, jftmdb.ErrNotFound):
+			// Record the miss so the next restart does not ask again.
+			_ = os.WriteFile(s.missPath(it.ID), nil, 0o644)
+			missed++
+			s.log.Debug("no artwork match", "title", it.Name, "year", it.Year)
+			continue
+		case err != nil:
+			failed++
+			s.log.Warn("artwork lookup failed", "title", it.Name, "err", err)
+			// A rejected key or a rate limit will fail for every remaining
+			// item too; stopping keeps the log readable and the key safe.
+			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "429") {
+				s.log.Error("stopping artwork fetch", "reason", err)
+				return
+			}
+			continue
+		}
+
+		if err := s.tmdb.DownloadPoster(ctx, m.PosterPath, s.posterPath(it.ID)); err != nil {
+			failed++
+			s.log.Warn("poster download failed", "title", it.Name, "err", err)
+			continue
+		}
+		got++
+		s.log.Debug("artwork fetched", "title", it.Name, "matched", m.Title, "year", m.Year)
+	}
+
+	s.log.Info("artwork fetch complete",
+		"downloaded", got, "unmatched", missed, "failed", failed, "took", time.Since(start))
+
+	// Republish so the new posters appear without waiting for a rescan.
+	if got > 0 {
+		items := s.items.All()
+		for i := range items {
+			if items[i].PrimaryImage == "" {
+				if p := s.cachedPoster(items[i].ID); p != "" {
+					items[i].PrimaryImage = p
+				}
+			}
+		}
+		s.items.Replace(items)
+	}
+}
+
 // ---------------------------------------------------------------- DTOs
 
 // Field names are PascalCase and shapes match upstream exactly. Where a client
@@ -457,6 +1036,274 @@ type AuthenticationResult struct {
 	ServerID    string         `json:"ServerId"`
 }
 
+// QueryResult is the envelope every list endpoint returns. Clients read
+// TotalRecordCount to drive paging, so it is the total matching the query, not
+// the length of Items.
+type QueryResult[T any] struct {
+	Items            []T `json:"Items"`
+	TotalRecordCount int `json:"TotalRecordCount"`
+	StartIndex       int `json:"StartIndex"`
+}
+
+// BaseItemDto is the shape every item on the wire takes -- libraries, folders,
+// movies, tracks. This is the subset needed to render a library view; the full
+// upstream DTO has well over a hundred fields and they get added as the things
+// that populate them get built.
+//
+// The slice and map fields have no omitempty on purpose. Clients iterate them
+// without null checks, so they must serialize as [] and {} rather than null.
+type BaseItemDto struct {
+	Name                 string            `json:"Name"`
+	ServerID             string            `json:"ServerId"`
+	ID                   jfid.GUID         `json:"Id"`
+	SortName             string            `json:"SortName"`
+	Path                 string            `json:"Path,omitempty"`
+	ChildCount           int               `json:"ChildCount"`
+	Type                 string            `json:"Type"`
+	CollectionType       string            `json:"CollectionType,omitempty"`
+	IsFolder             bool              `json:"IsFolder"`
+	ParentID             jfid.GUID         `json:"ParentId"`
+	MediaType            string            `json:"MediaType"`
+	LocationType         string            `json:"LocationType"`
+	DisplayPreferencesID string            `json:"DisplayPreferencesId"`
+	CanDelete            bool              `json:"CanDelete"`
+	CanDownload          bool              `json:"CanDownload"`
+	PlayAccess           string            `json:"PlayAccess"`
+	UserData             *UserItemDataDto  `json:"UserData,omitempty"`
+	ImageTags            map[string]string `json:"ImageTags"`
+	BackdropImageTags    []string          `json:"BackdropImageTags"`
+	ImageBlurHashes      map[string]any    `json:"ImageBlurHashes"`
+	ProviderIDs          map[string]string `json:"ProviderIds"`
+	Tags                 []string          `json:"Tags"`
+	Genres               []string          `json:"Genres"`
+	Studios              []any             `json:"Studios"`
+	People               []any             `json:"People"`
+	GenreItems           []any             `json:"GenreItems"`
+	ExternalUrls         []any             `json:"ExternalUrls"`
+	RemoteTrailers       []any             `json:"RemoteTrailers"`
+	LockedFields         []string          `json:"LockedFields"`
+	LockData             bool              `json:"LockData"`
+
+	// Populated for scanned media. ProductionYear and RunTimeTicks are
+	// pointers so an unknown value renders as null rather than as 0 -- a
+	// client shows a zero-length item as unplayable, and year 0 as a real year.
+	ProductionYear *int     `json:"ProductionYear"`
+	RunTimeTicks   *int64   `json:"RunTimeTicks"`
+	IndexNumber    *int     `json:"IndexNumber"`
+	Container      string   `json:"Container,omitempty"`
+	Album          string   `json:"Album,omitempty"`
+	AlbumArtist    string   `json:"AlbumArtist,omitempty"`
+	Artists        []string `json:"Artists"`
+}
+
+// mediaTypes maps a scanned kind to the MediaType clients switch on to pick a
+// player.
+var mediaTypes = map[jfscan.Kind]string{
+	jfscan.KindMovie: "Video",
+	jfscan.KindVideo: "Video",
+	jfscan.KindAudio: "Audio",
+}
+
+// toItemDto renders a scanned item for the wire.
+func (s *Server) toItemDto(it jfscan.Item) BaseItemDto {
+	media := mediaTypes[it.Kind]
+	if media == "" {
+		media = "Unknown"
+	}
+
+	d := BaseItemDto{
+		Name:                 it.Name,
+		ServerID:             s.serverID.String(),
+		ID:                   it.ID,
+		SortName:             it.SortName,
+		Path:                 it.Path,
+		Type:                 string(it.Kind),
+		IsFolder:             it.IsFolder,
+		ParentID:             it.ParentID,
+		MediaType:            media,
+		LocationType:         "FileSystem",
+		DisplayPreferencesID: it.ID.String(),
+		Container:            it.Container,
+		Album:                it.Album,
+		AlbumArtist:          it.AlbumArtist,
+		CanDelete:            false, // media is treated as read-only
+		CanDownload:          true,
+		PlayAccess:           "Full",
+		ImageTags:            map[string]string{},
+		BackdropImageTags:    []string{},
+		ImageBlurHashes:      map[string]any{},
+		ProviderIDs:          map[string]string{},
+		Tags:                 []string{},
+		Genres:               []string{},
+		Studios:              []any{},
+		People:               []any{},
+		GenreItems:           []any{},
+		ExternalUrls:         []any{},
+		RemoteTrailers:       []any{},
+		LockedFields:         []string{},
+		Artists:              []string{},
+		UserData: &UserItemDataDto{
+			Key:    it.ID.String(),
+			ItemID: it.ID,
+		},
+	}
+	if it.Year > 0 {
+		y := it.Year
+		d.ProductionYear = &y
+	}
+	if it.IndexNumber > 0 {
+		n := it.IndexNumber
+		d.IndexNumber = &n
+	}
+	if it.AlbumArtist != "" {
+		d.Artists = []string{it.AlbumArtist}
+	}
+	if it.IsFolder {
+		d.ChildCount = s.items.ChildCount(it.ID)
+	}
+	// A non-empty ImageTags.Primary is what makes a client request the image at
+	// all; an item with no local artwork must not advertise one, or every
+	// poster slot fires a request that can only 404.
+	if it.PrimaryImage != "" {
+		tag := jfid.ImageTag(it.PrimaryImage, jftime.UnixToTicks(it.Modified), jfid.UTF16LE)
+		d.ImageTags["Primary"] = tag
+	}
+	// RunTimeTicks stays nil: nothing here probes container duration, and
+	// reporting 0 would make every item look zero-length.
+	return d
+}
+
+// UserItemDataDto carries per-user playback state. A library folder has none of
+// it, but clients still expect the object to be present and shaped.
+type UserItemDataDto struct {
+	PlaybackPositionTicks int64     `json:"PlaybackPositionTicks"`
+	PlayCount             int       `json:"PlayCount"`
+	IsFavorite            bool      `json:"IsFavorite"`
+	Played                bool      `json:"Played"`
+	Key                   string    `json:"Key"`
+	ItemID                jfid.GUID `json:"ItemId"`
+}
+
+// DisplayPreferencesDto is the client's own UI state -- sort order, view mode,
+// image sizes. The server is only a store for it.
+//
+// It is not optional: a client that asks for its preferences and gets an error
+// can fail before it ever renders a library, which is why this answers with
+// defaults rather than 501 even though nothing is persisted yet.
+type DisplayPreferencesDto struct {
+	ID                 string            `json:"Id"`
+	Client             string            `json:"Client"`
+	ViewType           string            `json:"ViewType"`
+	SortBy             string            `json:"SortBy"`
+	SortOrder          string            `json:"SortOrder"`
+	IndexBy            string            `json:"IndexBy,omitempty"`
+	ScrollDirection    string            `json:"ScrollDirection"`
+	RememberIndexing   bool              `json:"RememberIndexing"`
+	RememberSorting    bool              `json:"RememberSorting"`
+	ShowBackdrop       bool              `json:"ShowBackdrop"`
+	ShowSidebar        bool              `json:"ShowSidebar"`
+	PrimaryImageHeight int               `json:"PrimaryImageHeight"`
+	PrimaryImageWidth  int               `json:"PrimaryImageWidth"`
+	CustomPrefs        map[string]string `json:"CustomPrefs"`
+}
+
+func defaultDisplayPreferences(id, client string) DisplayPreferencesDto {
+	return DisplayPreferencesDto{
+		ID:                 id,
+		Client:             client,
+		ViewType:           "",
+		SortBy:             "SortName",
+		SortOrder:          "Ascending",
+		ScrollDirection:    "Horizontal",
+		RememberIndexing:   false,
+		RememberSorting:    false,
+		ShowBackdrop:       true,
+		ShowSidebar:        false,
+		PrimaryImageHeight: 250,
+		PrimaryImageWidth:  250,
+		CustomPrefs:        map[string]string{},
+	}
+}
+
+// collectionFolderType is the .NET type name of a library root. It is part of
+// the ID derivation, so it has to be carried verbatim.
+const collectionFolderType = "MediaBrowser.Controller.Entities.CollectionFolder"
+
+// virtualFolderPath mirrors upstream's on-disk layout. Jellyfin does not derive
+// a library's ID from its media path: it creates a directory per library under
+// <data>/root/default/<Name> containing a .mblink that points at the media, and
+// the CollectionFolder ID is an MD5 over *that* path.
+//
+// !! UNVERIFIED, same caveat as jfid.NewItemID !!
+//
+// This reproduces the layout so the IDs at least can match upstream, but I have
+// not confirmed it against a real database. If library IDs must survive a
+// migration, check one with:
+//
+//	sqlite3 library.db "select hex(guid), Path from BaseItems
+//	                    where type like '%CollectionFolder%';"
+//
+// Getting this wrong costs the per-library client state (view mode, sort) and
+// nothing else -- item IDs are derived separately.
+func (l Library) virtualFolderPath(dataDir string) string {
+	return filepath.Join(dataDir, "root", "default", l.Name)
+}
+
+func (l Library) ID(dataDir string) jfid.GUID {
+	return jfid.NewItemID(l.virtualFolderPath(dataDir), collectionFolderType, "", jfid.UTF16LE)
+}
+
+// toViewDto renders one configured library as the CollectionFolder a client
+// shows in its sidebar.
+func (s *Server) toViewDto(l Library) BaseItemDto {
+	id := l.ID(s.cfg.Paths.Data)
+	return BaseItemDto{
+		Name:           l.Name,
+		ServerID:       s.serverID.String(),
+		ID:             id,
+		SortName:       strings.ToLower(l.Name),
+		Path:           l.Path,
+		Type:           "CollectionFolder",
+		CollectionType: l.Type,
+		IsFolder:       true,
+		MediaType:      "Unknown",
+		LocationType:   "FileSystem",
+		// Clients key their per-view UI state on this, so it must be stable
+		// across restarts -- which it is, being derived from the library name.
+		DisplayPreferencesID: id.String(),
+		// Deleting a library root is a server-admin operation, and this build
+		// treats media as read-only regardless.
+		CanDelete:         false,
+		CanDownload:       false,
+		PlayAccess:        "Full",
+		ChildCount:        s.items.ChildCount(id),
+		ImageTags:         map[string]string{},
+		BackdropImageTags: []string{},
+		ImageBlurHashes:   map[string]any{},
+		ProviderIDs:       map[string]string{},
+		Tags:              []string{},
+		Genres:            []string{},
+		Studios:           []any{},
+		People:            []any{},
+		GenreItems:        []any{},
+		ExternalUrls:      []any{},
+		RemoteTrailers:    []any{},
+		LockedFields:      []string{},
+		UserData: &UserItemDataDto{
+			Key:    id.String(),
+			ItemID: id,
+		},
+	}
+}
+
+func (s *Server) views() []BaseItemDto {
+	out := make([]BaseItemDto, 0, len(s.cfg.Libraries))
+	for _, l := range s.cfg.Libraries {
+		out = append(out, s.toViewDto(l))
+	}
+	return out
+}
+
 func toUserDto(u *User, serverID string) UserDto {
 	d := UserDto{
 		Name:                  u.Name,
@@ -512,8 +1359,12 @@ type Server struct {
 	cfg      *Config
 	log      *slog.Logger
 	store    *Store
+	items    *ItemStore
+	tmdb     *jftmdb.Client // nil when the provider is disabled
 	serverID jfid.GUID
 	started  time.Time
+
+	artworkRunning atomic.Bool
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -656,6 +1507,121 @@ func (s *Server) routes() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	}, false))
 
+	// --- libraries and views -----------------------------------------------
+
+	// Both spellings of the same thing. Newer clients call /UserViews with the
+	// user in a query parameter; older ones -- Delfin among them -- use the
+	// per-user path form. Neither is deprecated enough to skip.
+	mux.HandleFunc("GET /UserViews", s.authenticate(s.handleUserViews, false))
+	mux.HandleFunc("GET /Users/{userId}/Views", s.authenticate(s.handleUserViews, false))
+
+	mux.HandleFunc("GET /Users/{userId}/Items", s.authenticate(s.handleUserItems, false))
+	mux.HandleFunc("GET /Items", s.authenticate(s.handleUserItems, false))
+
+	// These literal segments MUST be registered alongside the {itemId}
+	// wildcard. Without them "/Users/{id}/Items/Latest" matches the wildcard,
+	// "Latest" is parsed as a GUID, and the client's home screen gets a 400.
+	// Go's mux prefers the more specific pattern, so registration order does
+	// not matter -- but omitting them silently breaks real endpoints.
+	mux.HandleFunc("GET /Users/{userId}/Items/Latest", s.authenticate(s.handleLatestItems, false))
+	mux.HandleFunc("GET /Items/Latest", s.authenticate(s.handleLatestItems, false))
+
+	// Resume needs playback state, which nothing records yet: an empty list is
+	// the truthful answer, and it keeps "Continue Watching" from erroring.
+	mux.HandleFunc("GET /Users/{userId}/Items/Resume", s.authenticate(s.handleResumeItems, false))
+	mux.HandleFunc("GET /Items/Resume", s.authenticate(s.handleResumeItems, false))
+
+	mux.HandleFunc("GET /Users/{userId}/Items/Root", s.authenticate(s.handleItemsRoot, false))
+
+	mux.HandleFunc("GET /Items/{itemId}", s.authenticate(s.handleItemByID, false))
+	mux.HandleFunc("GET /Users/{userId}/Items/{itemId}", s.authenticate(s.handleItemByID, false))
+
+	// --- playback ----------------------------------------------------------
+
+	mux.HandleFunc("GET /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
+	mux.HandleFunc("POST /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
+
+	// The stream endpoints are NOT behind s.authenticate. A media player is
+	// frequently a separate process (libmpv, ExoPlayer, an <video> element) that
+	// cannot attach an Authorization header, so upstream passes the token in the
+	// query string -- jfauth.FromRequest already accepts api_key there. Leaving
+	// these open matches upstream and is what makes playback work at all.
+	// Upstream exposes both /stream and /stream.{container}. Go's mux only
+	// allows a wildcard as a WHOLE segment -- "stream.{container}" panics at
+	// registration -- so the last segment is captured entire and checked in the
+	// handler.
+	for _, p := range []string{
+		"GET /Videos/{itemId}/{stream}", "HEAD /Videos/{itemId}/{stream}",
+		"GET /Audio/{itemId}/{stream}", "HEAD /Audio/{itemId}/{stream}",
+	} {
+		mux.HandleFunc(p, s.handleStream)
+	}
+
+	// Playback state reporting. Nothing is stored -- there is no database -- but
+	// these must not error: a client that cannot report progress may refuse to
+	// start, and it will retry a failing call for the whole of playback.
+	for _, p := range []string{
+		"POST /Sessions/Playing", "POST /Sessions/Playing/Progress",
+		"POST /Sessions/Playing/Stopped", "POST /Sessions/Playing/Ping",
+	} {
+		mux.HandleFunc(p, s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+			w.WriteHeader(http.StatusNoContent)
+		}, false))
+	}
+
+	// Artwork. Unauthenticated on purpose: these URLs go straight into <img>
+	// tags, which cannot set an Authorization header, and upstream serves them
+	// the same way.
+	mux.HandleFunc("GET /Items/{itemId}/Images/{imageType}", s.handleItemImage)
+	mux.HandleFunc("GET /Items/{itemId}/Images/{imageType}/{index}", s.handleItemImage)
+
+	// Triggering a rescan. Upstream exposes this as a scheduled task; this is
+	// the smallest thing that lets a client ask for one.
+	mux.HandleFunc("POST /Library/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		go s.scanLibraries()
+		w.WriteHeader(http.StatusNoContent)
+	}, true))
+
+	// Retry artwork without a full rescan. Clearing the miss markers first
+	// makes this also a way to re-try titles TMDB could not match, after
+	// renaming the files that caused it.
+	mux.HandleFunc("POST /Library/RefreshArtwork", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		if s.tmdb == nil {
+			problem(w, http.StatusServiceUnavailable, "No artwork provider is configured")
+			return
+		}
+		if r.URL.Query().Get("retryMissed") == "true" {
+			s.clearArtworkMisses()
+		}
+		go s.fetchArtwork()
+		w.WriteHeader(http.StatusNoContent)
+	}, true))
+
+	// A user with no avatar is a 404, not a 501: that is the same answer
+	// upstream gives, and clients fall back to a generated monogram on it.
+	mux.HandleFunc("GET /Users/{userId}/Images/Primary", func(w http.ResponseWriter, r *http.Request) {
+		problem(w, http.StatusNotFound, "No primary image")
+	})
+
+	// Display preferences are the client's own UI state. Nothing is persisted
+	// yet, so every client gets the defaults back; answering with a valid shape
+	// matters more than remembering it, because a client that fails to read its
+	// preferences can stop before rendering anything at all.
+	mux.HandleFunc("GET /DisplayPreferences/{prefsId}", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("prefsId")
+		s.log.Debug("display preferences read (not persisted)", "id", id)
+		writeJSON(w, 200, defaultDisplayPreferences(id, r.URL.Query().Get("client")))
+	}, false))
+
+	// Accepted and discarded. Returning an error here makes some clients retry
+	// the write in a loop.
+	mux.HandleFunc("POST /DisplayPreferences/{prefsId}", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		s.log.Debug("display preferences write discarded", "id", r.PathValue("prefsId"))
+		w.WriteHeader(http.StatusNoContent)
+	}, false))
+
 	// --- websocket ---------------------------------------------------------
 
 	mux.HandleFunc("GET /socket", s.handleSocket)
@@ -672,6 +1638,646 @@ func (s *Server) routes() http.Handler {
 	h = s.withCORS(h)
 	h = s.withLogging(h)
 	return h
+}
+
+// requestedUser resolves which user a request is about and enforces that the
+// caller may act as them.
+//
+// The user may arrive as a path segment or as a userId query parameter, and
+// -- this is the part that bites -- a client will happily send back a DASHED
+// GUID even though the server always emits dashless. Delfin does exactly that:
+// it receives bdfc15bd7aff... and asks for /Users/bdfc15bd-7aff-.../Views.
+// jfid.Parse accepts both forms, which is the only reason this works.
+//
+// An empty user reference means "me", which is what the query-parameter form
+// omits it for.
+func (s *Server) requestedUser(r *http.Request) (*User, bool) {
+	caller := authFrom(r).User
+
+	raw := r.PathValue("userId")
+	if raw == "" {
+		raw = r.URL.Query().Get("userId")
+	}
+	if raw == "" {
+		return caller, true
+	}
+
+	id, err := jfid.Parse(raw)
+	if err != nil {
+		return nil, false
+	}
+	if id == caller.ID {
+		return caller, true
+	}
+	// Asking about somebody else is an administrator's privilege.
+	if !caller.Admin {
+		return nil, false
+	}
+	u := s.store.UserByID(id)
+	return u, u != nil
+}
+
+func (s *Server) handleUserViews(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	views := s.views()
+	writeJSON(w, 200, QueryResult[BaseItemDto]{
+		Items:            views,
+		TotalRecordCount: len(views),
+		StartIndex:       0,
+	})
+}
+
+// handleUserItems answers the browse query.
+//
+// At the top level -- no ParentId -- the answer is the library roots, which the
+// configuration already gives us. Anything below that needs the scanner, so it
+// returns an empty result rather than an error: the client renders an empty
+// library, which is true, instead of an error dialog, which would be
+// misleading. The WARN keeps the gap visible in the log.
+func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+
+	q := r.URL.Query()
+	raw := q.Get("ParentId")
+	if raw == "" {
+		raw = q.Get("parentId")
+	}
+
+	// No parent means the top level, which is the set of libraries.
+	if raw == "" {
+		views := s.views()
+		writeJSON(w, 200, QueryResult[BaseItemDto]{
+			Items:            views,
+			TotalRecordCount: len(views),
+			StartIndex:       0,
+		})
+		return
+	}
+
+	parent, err := jfid.Parse(raw)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed ParentId")
+		return
+	}
+
+	children := s.items.Children(parent)
+	items := make([]BaseItemDto, 0, len(children))
+	for _, c := range children {
+		items = append(items, s.toItemDto(c))
+	}
+
+	total := len(items)
+	items = page(items, q)
+
+	writeJSON(w, 200, QueryResult[BaseItemDto]{
+		Items:            items,
+		TotalRecordCount: total,
+		StartIndex:       startIndex(q),
+	})
+}
+
+// page applies StartIndex and Limit. TotalRecordCount stays the full count, so
+// the client can still size its scrollbar.
+func page(items []BaseItemDto, q url.Values) []BaseItemDto {
+	start := startIndex(q)
+	if start >= len(items) {
+		return []BaseItemDto{}
+	}
+	items = items[start:]
+
+	if l := q.Get("Limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n >= 0 && n < len(items) {
+			items = items[:n]
+		}
+	}
+	return items
+}
+
+func startIndex(q url.Values) int {
+	n, err := strconv.Atoi(q.Get("StartIndex"))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// handleLatestItems answers the home screen's "Recently Added" row.
+//
+// It returns a BARE ARRAY, not a QueryResult -- upstream is inconsistent here,
+// and a client handed {"Items":[...]} for this endpoint renders nothing.
+func (s *Server) handleLatestItems(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	q := r.URL.Query()
+
+	var pool []jfscan.Item
+	if raw := q.Get("ParentId"); raw != "" {
+		if parent, err := jfid.Parse(raw); err == nil {
+			pool = s.items.Descendants(parent)
+		}
+	} else {
+		pool = s.items.All()
+	}
+
+	// Newest first by mtime. Folders are excluded: "recently added" means
+	// media, not the directory it happens to live in.
+	media := pool[:0:0]
+	for _, it := range pool {
+		if !it.IsFolder {
+			media = append(media, it)
+		}
+	}
+	sort.Slice(media, func(i, j int) bool { return media[i].Modified.After(media[j].Modified) })
+
+	limit := 20
+	if n, err := strconv.Atoi(q.Get("Limit")); err == nil && n > 0 {
+		limit = n
+	}
+	if len(media) > limit {
+		media = media[:limit]
+	}
+
+	out := make([]BaseItemDto, 0, len(media))
+	for _, it := range media {
+		out = append(out, s.toItemDto(it))
+	}
+	writeJSON(w, 200, out)
+}
+
+// handleResumeItems answers "Continue Watching". Nothing records playback
+// position yet, so the honest answer is an empty result.
+func (s *Server) handleResumeItems(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	writeJSON(w, 200, QueryResult[BaseItemDto]{
+		Items: []BaseItemDto{}, TotalRecordCount: 0, StartIndex: 0,
+	})
+}
+
+// handleItemsRoot returns the synthetic folder every library hangs off.
+func (s *Server) handleItemsRoot(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	writeJSON(w, 200, BaseItemDto{
+		Name:              "Media Folders",
+		ServerID:          s.serverID.String(),
+		ID:                jfid.HashString("gofin-root:"+s.cfg.Server.Name, jfid.UTF16LE),
+		Type:              "Folder",
+		IsFolder:          true,
+		ChildCount:        len(s.cfg.Libraries),
+		MediaType:         "Unknown",
+		LocationType:      "FileSystem",
+		ImageTags:         map[string]string{},
+		BackdropImageTags: []string{},
+		ImageBlurHashes:   map[string]any{},
+		ProviderIDs:       map[string]string{},
+		Tags:              []string{},
+		Genres:            []string{},
+		Studios:           []any{},
+		People:            []any{},
+		GenreItems:        []any{},
+		ExternalUrls:      []any{},
+		RemoteTrailers:    []any{},
+		LockedFields:      []string{},
+		Artists:           []string{},
+	})
+}
+
+// handleItemImage serves local artwork.
+//
+// An item with no artwork answers 404, never 501. The difference matters: a
+// client reads 404 as "no image, draw a placeholder" and stops, while a 501
+// reads as a broken server and gets retried. This library has no local posters
+// at all -- release groups ship advertising banners instead -- so 404 is the
+// common path and it needs to be cheap and final.
+func (s *Server) handleItemImage(w http.ResponseWriter, r *http.Request) {
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+	if t := r.PathValue("imageType"); !strings.EqualFold(t, "Primary") {
+		// Backdrop, Logo, Thumb and friends all need a provider.
+		problem(w, http.StatusNotFound, "No image of that type")
+		return
+	}
+
+	it, ok := s.items.Get(id)
+	if !ok || it.PrimaryImage == "" {
+		problem(w, http.StatusNotFound, "No primary image")
+		return
+	}
+
+	f, err := os.Open(it.PrimaryImage)
+	if err != nil {
+		problem(w, http.StatusNotFound, "No primary image")
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		problem(w, http.StatusNotFound, "No primary image")
+		return
+	}
+
+	// Artwork only changes when the file does, so it is worth caching hard.
+	// This is the one response in the server where that is safe.
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("ETag", `"`+jfid.ImageTag(it.PrimaryImage, jftime.UnixToTicks(fi.ModTime()), jfid.UTF16LE)+`"`)
+	http.ServeContent(w, r, filepath.Base(it.PrimaryImage), fi.ModTime(), f)
+}
+
+// ---------------------------------------------------------------- playback
+
+// MediaStreamDto is one track inside a media source.
+type MediaStreamDto struct {
+	Codec              string `json:"Codec"`
+	Language           string `json:"Language,omitempty"`
+	Title              string `json:"Title,omitempty"`
+	DisplayTitle       string `json:"DisplayTitle,omitempty"`
+	Profile            string `json:"Profile,omitempty"`
+	Type               string `json:"Type"`
+	Index              int    `json:"Index"`
+	IsDefault          bool   `json:"IsDefault"`
+	IsForced           bool   `json:"IsForced"`
+	IsExternal         bool   `json:"IsExternal"`
+	IsInterlaced       bool   `json:"IsInterlaced"`
+	IsTextSubtitleStr  bool   `json:"IsTextSubtitleStream"`
+	SupportsExternalSt bool   `json:"SupportsExternalStream"`
+	Width              int    `json:"Width,omitempty"`
+	Height             int    `json:"Height,omitempty"`
+	Channels           int    `json:"Channels,omitempty"`
+	SampleRate         int    `json:"SampleRate,omitempty"`
+	BitRate            int    `json:"BitRate,omitempty"`
+	PixelFormat        string `json:"PixelFormat,omitempty"`
+	Level              int    `json:"Level,omitempty"`
+}
+
+// MediaSourceInfo tells a client how it may play an item. Without one, a client
+// has nothing to open and sits on a spinner.
+type MediaSourceInfo struct {
+	Protocol             string           `json:"Protocol"`
+	ID                   string           `json:"Id"`
+	Path                 string           `json:"Path"`
+	Type                 string           `json:"Type"`
+	Container            string           `json:"Container"`
+	Size                 *int64           `json:"Size"`
+	Name                 string           `json:"Name"`
+	IsRemote             bool             `json:"IsRemote"`
+	ETag                 string           `json:"ETag,omitempty"`
+	RunTimeTicks         *int64           `json:"RunTimeTicks"`
+	SupportsTranscoding  bool             `json:"SupportsTranscoding"`
+	SupportsDirectStream bool             `json:"SupportsDirectStream"`
+	SupportsDirectPlay   bool             `json:"SupportsDirectPlay"`
+	IsInfiniteStream     bool             `json:"IsInfiniteStream"`
+	RequiresOpening      bool             `json:"RequiresOpening"`
+	RequiresClosing      bool             `json:"RequiresClosing"`
+	RequiresLooping      bool             `json:"RequiresLooping"`
+	SupportsProbing      bool             `json:"SupportsProbing"`
+	MediaStreams         []MediaStreamDto `json:"MediaStreams"`
+	MediaAttachments     []any            `json:"MediaAttachments"`
+	Formats              []string         `json:"Formats"`
+	Bitrate              *int             `json:"Bitrate"`
+	DirectStreamURL      string           `json:"DirectStreamUrl,omitempty"`
+	TranscodingURL       string           `json:"TranscodingUrl,omitempty"`
+	VideoType            string           `json:"VideoType,omitempty"`
+	DefaultAudioStream   *int             `json:"DefaultAudioStreamIndex"`
+	DefaultSubtitleIndex *int             `json:"DefaultSubtitleStreamIndex"`
+}
+
+type PlaybackInfoResponse struct {
+	MediaSources  []MediaSourceInfo `json:"MediaSources"`
+	PlaySessionID string            `json:"PlaySessionId"`
+	ErrorCode     *string           `json:"ErrorCode"`
+}
+
+// probeCachePath stores a probe result so ffprobe runs once per file rather
+// than on every playback request.
+func (s *Server) probeCachePath(id jfid.GUID) string {
+	return filepath.Join(s.cfg.Paths.Cache, "probe", id.String()+".json")
+}
+
+// mediaInfoFor returns container metadata, probing on demand and caching the
+// result. A probe failure is not fatal: playback of a direct-playable file does
+// not need it, so the caller falls back to what the scan already knew.
+func (s *Server) mediaInfoFor(it jfscan.Item) *jfprobe.MediaInfo {
+	p := s.probeCachePath(it.ID)
+	if b, err := os.ReadFile(p); err == nil {
+		var mi jfprobe.MediaInfo
+		if json.Unmarshal(b, &mi) == nil {
+			return &mi
+		}
+	}
+	if !jfprobe.Available() {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	mi, err := jfprobe.Probe(ctx, it.Path)
+	if err != nil {
+		s.log.Warn("probe failed", "path", it.Path, "err", err)
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
+		if b, err := json.Marshal(mi); err == nil {
+			_ = os.WriteFile(p, b, 0o644)
+		}
+	}
+	return mi
+}
+
+// mediaSource builds the MediaSourceInfo for an item.
+//
+// Everything here is direct play: the file is handed over byte for byte, with
+// no transcoding. That covers most clients for most files, and it is the only
+// honest answer while no encoder is wired up -- claiming SupportsTranscoding
+// would make a client ask for a transcode that never arrives.
+func (s *Server) mediaSource(it jfscan.Item) MediaSourceInfo {
+	container := it.Container
+	size := it.Size
+
+	src := MediaSourceInfo{
+		Protocol:             "File",
+		ID:                   it.ID.String(),
+		Path:                 it.Path,
+		Type:                 "Default",
+		Name:                 it.Name,
+		IsRemote:             false,
+		SupportsDirectPlay:   true,
+		SupportsDirectStream: true,
+		SupportsTranscoding:  false,
+		SupportsProbing:      true,
+		MediaStreams:         []MediaStreamDto{},
+		MediaAttachments:     []any{},
+		Formats:              []string{},
+	}
+
+	if mi := s.mediaInfoFor(it); mi != nil {
+		if mi.Container != "" {
+			container = mi.Container
+		}
+		if mi.Size > 0 {
+			size = mi.Size
+		}
+		if mi.Duration > 0 {
+			ticks := int64(mi.Duration / 100)
+			src.RunTimeTicks = &ticks
+		}
+		if mi.Bitrate > 0 {
+			b := mi.Bitrate
+			src.Bitrate = &b
+		}
+		for _, st := range mi.Streams {
+			d := MediaStreamDto{
+				Codec:              st.Codec,
+				Language:           st.Language,
+				Title:              st.Title,
+				DisplayTitle:       streamDisplayTitle(st),
+				Profile:            st.Profile,
+				Type:               st.Type,
+				Index:              st.Index,
+				IsDefault:          st.IsDefault,
+				IsForced:           st.IsForced,
+				Width:              st.Width,
+				Height:             st.Height,
+				Channels:           st.Channels,
+				SampleRate:         st.SampleRate,
+				BitRate:            st.BitRate,
+				PixelFormat:        st.PixelFormat,
+				SupportsExternalSt: st.Type == "Subtitle",
+				IsTextSubtitleStr:  st.Type == "Subtitle" && isTextSubtitle(st.Codec),
+			}
+			src.MediaStreams = append(src.MediaStreams, d)
+			if src.DefaultAudioStream == nil && st.Type == "Audio" && st.IsDefault {
+				i := st.Index
+				src.DefaultAudioStream = &i
+			}
+		}
+	}
+
+	src.Container = container
+	if size > 0 {
+		sz := size
+		src.Size = &sz
+	}
+
+	// The URL the client actually fetches. Jellyfin puts the token in the query
+	// string here because media players are often separate processes that
+	// cannot carry the Authorization header.
+	kind := "Videos"
+	if it.Kind == jfscan.KindAudio {
+		kind = "Audio"
+	}
+	src.DirectStreamURL = fmt.Sprintf("%s/%s/%s/stream.%s?static=true&mediaSourceId=%s",
+		s.cfg.Server.BaseURL, kind, it.ID.String(), container, it.ID.String())
+
+	if it.Kind == jfscan.KindMovie || it.Kind == jfscan.KindVideo {
+		src.VideoType = "VideoFile"
+	}
+	return src
+}
+
+func isTextSubtitle(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text":
+		return true
+	}
+	return false
+}
+
+// streamDisplayTitle is the label a client shows in its track picker.
+func streamDisplayTitle(st jfprobe.Stream) string {
+	if st.Title != "" {
+		return st.Title
+	}
+	var parts []string
+	if st.Language != "" {
+		parts = append(parts, strings.ToUpper(st.Language))
+	}
+	switch st.Type {
+	case "Video":
+		if st.Height > 0 {
+			parts = append(parts, fmt.Sprintf("%dp", st.Height))
+		}
+	case "Audio":
+		switch st.Channels {
+		case 1:
+			parts = append(parts, "Mono")
+		case 2:
+			parts = append(parts, "Stereo")
+		case 6:
+			parts = append(parts, "5.1")
+		case 8:
+			parts = append(parts, "7.1")
+		}
+	}
+	if st.Codec != "" {
+		parts = append(parts, strings.ToUpper(st.Codec))
+	}
+	return strings.Join(parts, " ")
+}
+
+// handlePlaybackInfo answers "how do I play this".
+//
+// Both GET and POST reach here. Clients POST a DeviceProfile describing what
+// they can decode; this build ignores it, because every answer is direct play
+// regardless -- there is no encoder to offer an alternative.
+func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+	if r.Body != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+	}
+
+	it, ok := s.items.Get(id)
+	if !ok {
+		problem(w, http.StatusNotFound, "Item not found")
+		return
+	}
+	if it.IsFolder {
+		problem(w, http.StatusBadRequest, "Not a playable item")
+		return
+	}
+
+	writeJSON(w, 200, PlaybackInfoResponse{
+		MediaSources:  []MediaSourceInfo{s.mediaSource(it)},
+		PlaySessionID: newMessageID(),
+	})
+}
+
+// handleStream serves the media file itself.
+//
+// http.ServeContent does the heavy lifting: it handles Range requests, which is
+// what makes seeking work, and returns 206 with the right Content-Range. A
+// naive io.Copy here would force clients to download from the start every time
+// the user drags the scrubber.
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	// The segment is "stream" or "stream.<container>"; anything else under
+	// /Videos/{id}/ is a different endpoint and must not serve the file.
+	seg := r.PathValue("stream")
+
+	// Multi-part videos. Registering this as its own pattern conflicts with the
+	// wildcard above -- Go rejects a more specific GET route alongside a
+	// broader HEAD one -- so it is handled here. Nothing stacks parts into a
+	// single playback yet, so the honest answer is an empty list.
+	if seg == "AdditionalParts" {
+		writeJSON(w, 200, QueryResult[BaseItemDto]{Items: []BaseItemDto{}, TotalRecordCount: 0})
+		return
+	}
+
+	if seg != "stream" && !strings.HasPrefix(seg, "stream.") {
+		s.log.Warn("unimplemented endpoint", "method", r.Method, "path", r.URL.Path)
+		problem(w, http.StatusNotImplemented, "Not implemented in this build")
+		return
+	}
+
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+	it, ok := s.items.Get(id)
+	if !ok || it.IsFolder {
+		problem(w, http.StatusNotFound, "Item not found")
+		return
+	}
+
+	f, err := os.Open(it.Path)
+	if err != nil {
+		s.log.Error("cannot open media", "path", it.Path, "err", err)
+		problem(w, http.StatusNotFound, "Media file unavailable")
+		return
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		problem(w, http.StatusNotFound, "Media file unavailable")
+		return
+	}
+
+	if ct := contentType(it.Container); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	// Advertising range support explicitly matters for players that check
+	// before attempting to seek.
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	s.log.Debug("streaming", "item", it.Name, "range", r.Header.Get("Range"))
+	http.ServeContent(w, r, filepath.Base(it.Path), fi.ModTime(), f)
+}
+
+// contentType maps a container to a MIME type. Getting this wrong makes some
+// browsers refuse to play a file they can otherwise decode.
+func contentType(container string) string {
+	switch strings.ToLower(container) {
+	case "mkv", "matroska":
+		return "video/x-matroska"
+	case "mp4", "m4v", "mov":
+		return "video/mp4"
+	case "webm":
+		return "video/webm"
+	case "avi":
+		return "video/x-msvideo"
+	case "ts", "mpegts":
+		return "video/mp2t"
+	case "flac":
+		return "audio/flac"
+	case "mp3":
+		return "audio/mpeg"
+	case "m4a", "aac":
+		return "audio/mp4"
+	case "ogg", "oga", "opus":
+		return "audio/ogg"
+	case "wav":
+		return "audio/wav"
+	}
+	return ""
+}
+
+// handleItemByID serves a single item. Clients fetch this when opening a detail
+// page, and a library root has to resolve here too -- it is the item the
+// browse view was opened from.
+func (s *Server) handleItemByID(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requestedUser(r); !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+
+	if it, ok := s.items.Get(id); ok {
+		writeJSON(w, 200, s.toItemDto(it))
+		return
+	}
+	// A library root is not in the item store; it is built from configuration.
+	for _, l := range s.cfg.Libraries {
+		if l.ID(s.cfg.Paths.Data) == id {
+			writeJSON(w, 200, s.toViewDto(l))
+			return
+		}
+	}
+	problem(w, http.StatusNotFound, "Item not found")
 }
 
 func (s *Server) publicInfo(r *http.Request) PublicSystemInfo {
@@ -944,6 +2550,9 @@ func main() {
 		_          = fs.String("log-format", "text", "text|json")
 		dryRun     = fs.Bool("dry-run", false, "validate configuration and exit")
 	)
+	var libs libraryList
+	fs.Var(&libs, "library", "media library, repeatable: "+
+		"'name=Movies,type=movies,path=/mnt/media/Movies,readonly'")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "gofin — Jellyfin-compatible media server\n\n"+
 			"Usage:\n  gofin [serve|config init|version] [flags]\n\nFlags:\n")
@@ -1023,8 +2632,47 @@ func main() {
 		cfg:      cfg,
 		log:      log,
 		store:    store,
+		items:    NewItemStore(),
 		serverID: jfid.HashString("gofin-server:"+cfg.Server.Name, jfid.UTF16LE),
 		started:  time.Now(),
+	}
+
+	// The artwork provider is opt-in twice over: it has to be enabled AND
+	// given a key. Reaching the network is not something a media server should
+	// start doing because a config file gained a field.
+	if cfg.Metadata.TMDB.Enabled {
+		if cfg.Metadata.TMDB.APIKey == "" {
+			log.Warn("tmdb enabled but no api_key set; artwork fetching stays off. " +
+				"Get a free key at https://www.themoviedb.org/settings/api and put it " +
+				"in metadata.tmdb.api_key or $GOFIN_TMDB_API_KEY")
+		} else {
+			c := jftmdb.New(cfg.Metadata.TMDB.APIKey)
+			if cfg.Metadata.TMDB.Language != "" {
+				c.Language = cfg.Metadata.TMDB.Language
+			}
+			if cfg.Metadata.TMDB.PosterSize != "" {
+				c.PosterSize = cfg.Metadata.TMDB.PosterSize
+			}
+			srv.tmdb = c
+			log.Info("artwork provider enabled", "provider", "tmdb",
+				"language", c.Language, "poster_size", c.PosterSize)
+		}
+	}
+
+	// Media paths are checked before the listener opens: an unreadable library
+	// is almost always a mount that is not up yet or a permission problem, and
+	// both are far cheaper to see now than as an empty library after a scan.
+	if err := validateLibraryPaths(cfg.Libraries); err != nil {
+		log.Error("library configuration", "err", err)
+		os.Exit(1)
+	}
+	for _, l := range cfg.Libraries {
+		log.Info("library", "name", l.Name, "type", l.Type,
+			"path", l.Path, "readonly", l.IsReadOnly())
+	}
+	if len(cfg.Libraries) == 0 {
+		log.Warn("no libraries configured; add a \"libraries\" section to the config " +
+			"or pass -library")
 	}
 
 	if *dryRun {
@@ -1041,6 +2689,10 @@ func main() {
 		// No WriteTimeout: media streams and WebSockets are long-lived.
 		IdleTimeout: 120 * time.Second,
 	}
+
+	// Scan in the background: a large library would otherwise look like a
+	// server that hangs on startup.
+	go srv.scanLibraries()
 
 	go func() {
 		log.Info("listening", "addr", addr, "users", len(store.Users()), "version", Version)
