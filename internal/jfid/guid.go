@@ -130,9 +130,15 @@ func (g GUID) ToDotNetBytes() [16]byte {
 	return b
 }
 
-// FromDotNetHex parses 32 hex chars that are already in .NET byte order --
-// which is what `hex(guid)` returns from a Jellyfin SQLite database -- and
-// converts them to a GUID. Use this, not Parse, when reading library.db.
+// FromDotNetHex parses 32 hex chars that are already in .NET byte order and
+// converts them to a GUID.
+//
+// This is for PRE-10.10 databases only. Jellyfin stored item GUIDs as a
+// 16-byte BLOB in library.db, so `hex(guid)` came back byte-swapped and needed
+// this. Since 10.10 the data lives in jellyfin.db under EF Core, which maps
+// Guid to TEXT -- the column is an ordinary dashed GUID and Parse reads it
+// directly. Using this function on a modern database silently byte-swaps a
+// value that was already in the right order.
 func FromDotNetHex(s string) (GUID, error) {
 	b, err := hex.DecodeString(strings.ToLower(strings.ReplaceAll(s, "-", "")))
 	if err != nil {

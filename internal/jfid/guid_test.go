@@ -78,23 +78,48 @@ func TestDotNetByteOrder(t *testing.T) {
 }
 
 // TestKnownItemIDs is the test that decides whether migration works. It is
-// skipped until you fill in real vectors, which takes about two minutes:
+// skipped until you fill in real vectors, which takes about two minutes.
+//
+// WHICH QUERY TO RUN DEPENDS ON THE SERVER VERSION. Jellyfin 10.10 (the
+// 20241020 "LibraryDbMigration") folded library.db into the EF Core database
+// and changed how a GUID is stored, so the two eras need different commands:
+//
+// Jellyfin 10.10 and newer -- one jellyfin.db, GUIDs stored as TEXT:
+//
+//	$ sqlite3 /var/lib/jellyfin/data/jellyfin.db \
+//	    "select Id, Path, Type from BaseItems where Path is not null limit 5;"
+//
+// Id comes back as an ordinary dashed GUID, so paste it in as-is: Parse reads
+// it. Note the capitalised Id and Type columns -- EF Core renamed them.
+//
+// Jellyfin 10.9 and older -- raw SQLite in library.db, GUIDs stored as a
+// 16-byte BLOB in .NET byte order:
 //
 //	$ sqlite3 /var/lib/jellyfin/data/library.db \
 //	    "select hex(guid), Path, type from BaseItems where Path is not null limit 5;"
 //
-// The hex(guid) column is in .NET byte order, so feed it through
-// FromDotNetBytes to get the expected GUID. Then check which KeyEncoding
-// reproduces it. Once one vector matches, every ID in the library will.
+// hex(guid) is byte-swapped, so it has to go through FromDotNetHex.
+//
+// Either way: once one vector matches, every ID in the library will, and an
+// in-place migration keeps client caches, favourites and deep links.
 func TestKnownItemIDs(t *testing.T) {
 	vectors := []struct {
 		path     string
 		typeName string
-		wantHex  string // hex(guid) straight out of library.db
+		// want is either form: a dashed/dashless GUID as printed by 10.10+,
+		// or hex(guid) from a pre-10.10 library.db. dotNetOrder says which.
+		want        string
+		dotNetOrder bool
 	}{
+		// 10.10+:
 		// {"/media/movies/Arrival (2016)/Arrival (2016).mkv",
 		//  "MediaBrowser.Controller.Entities.Movies.Movie",
-		//  "...32 hex chars..."},
+		//  "f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b", false},
+		//
+		// 10.9 and older:
+		// {"/media/movies/Arrival (2016)/Arrival (2016).mkv",
+		//  "MediaBrowser.Controller.Entities.Movies.Movie",
+		//  "...32 hex chars from hex(guid)...", true},
 	}
 	if len(vectors) == 0 {
 		t.Skip("no real vectors yet -- see the comment above; this is the one " +
@@ -102,10 +127,17 @@ func TestKnownItemIDs(t *testing.T) {
 	}
 
 	for _, v := range vectors {
-		want, err := FromDotNetHex(v.wantHex)
-		if err != nil {
-			t.Fatalf("bad vector %q: %v", v.wantHex, err)
+		var want GUID
+		var err error
+		if v.dotNetOrder {
+			want, err = FromDotNetHex(v.want)
+		} else {
+			want, err = Parse(v.want)
 		}
+		if err != nil {
+			t.Fatalf("bad vector %q: %v", v.want, err)
+		}
+
 		var matched bool
 		for _, enc := range []KeyEncoding{UTF16LE, UTF8} {
 			if NewItemID(v.path, v.typeName, "", enc) == want {
