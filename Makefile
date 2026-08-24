@@ -45,7 +45,8 @@ export CGO_ENABLED
 GO_FILES := $(shell find . -type f -name '*.go' -not -path './vendor/*')
 
 # Cross-compilation matrix for `make dist`.
-PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+#PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+PLATFORMS ?= linux/amd64
 
 # ------------------------------------------------------------------- build
 

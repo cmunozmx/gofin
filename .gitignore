@@ -45,3 +45,12 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Configuration
+
+gofin.json
+
+# Build artifacts
+
+bin/
+dist/
