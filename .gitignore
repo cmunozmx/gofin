@@ -1,0 +1,47 @@
+# Build output (see Makefile: BIN_DIR, DIST_DIR)
+/bin/
+/dist/
+/gofin
+/gofin.exe
+
+# Test and coverage artifacts
+coverage.out
+coverage.html
+*.out
+*.test
+*.prof
+*.pprof
+
+# Go workspace files — machine-local, never committed
+go.work
+go.work.sum
+
+# Dependency directory, only if you ever vendor
+/vendor/
+
+# Runtime state the server writes (see gofin.json "paths")
+/gofin.json
+/data/
+/cache/
+/logs/
+*.log
+
+# Compiled object and archive files
+*.o
+*.a
+*.so
+*.dylib
+
+# Editor and OS cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+.env
+.env.*
+!.env.example

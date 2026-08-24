@@ -4,9 +4,10 @@ Jellyfin-wire-compatible media server. This tree is the *identity and protocol*
 layer: the parts where being wrong locks out every client at once, and which
 need no dependencies to get right.
 
-**I could not compile or run this.** The sandbox it was written in has no Go
-toolchain and no network access. Treat it as a careful draft: `go vet ./...` and
-`go test ./...` first, expect to fix a typo or two, and only then judge it.
+It builds, vets, and runs. The original draft was written without a Go
+toolchain; the only thing actually wrong with it was the file layout — every
+source file sat flat in the repo root while declaring the package it was
+*meant* to live in. Moving each into place was the whole fix. No logic changed.
 
 ## Build and run
 
@@ -34,6 +35,42 @@ Then point jellyfin-web at it. It will reach the login screen, authenticate,
 open the WebSocket, and then fail on `/UserViews` with a 501 — which is exactly
 the intended state. Every unimplemented route logs itself at WARN, so a browse
 attempt produces a prioritized to-do list.
+
+All of the above has been run against the built binary: `/System/Info/Public`
+and the login round-trip answer as shown, `/Users/Me`, `/System/Info`,
+`/System/Endpoint` and `/Sessions` return 200 with a token and 401 without,
+`/UserViews` and `/Items` return 501, and `/socket` completes the RFC 6455
+handshake, sends `ForceKeepAlive`, and answers `KeepAlive`.
+
+## Tests
+
+```sh
+go test ./...
+go test -race ./...     # the WebSocket write path is concurrent; this matters
+```
+
+93 test functions, 185 cases with subtests, all passing and race-clean.
+
+Where a value could be checked against something other than this code, it is.
+The PBKDF2-SHA512 known answers and the stored-hash fixtures come from Python's
+`hashlib`, so `pbkdf2SHA512` is checked against a reference implementation
+rather than against itself, and `verifyPassword` is shown to accept hashes an
+entirely different implementation produced — which is what matters when
+importing an existing user table. The WebSocket accept keys are computed the
+same way, and the first is the example from RFC 6455 §1.3. The `.NET` tick
+epoch offset is checked against Python's `datetime`.
+
+The WebSocket tests drive a real socket — `httptest.NewRecorder` cannot be
+hijacked — with a hand-rolled client that masks its frames, so framing,
+continuations, ping/pong, close, and all three payload-length encodings are
+exercised across their boundaries (125/126/65535/65536 bytes) rather than
+asserted about.
+
+What the suite deliberately pins, because these are the things that break every
+client at once: dashless GUIDs on the wire, empty policy arrays serializing as
+`[]` and never `null`, `LastLoginDate` as `null` rather than the year 1, 401 vs
+403 (a client re-prompts for login on one and merely hides a feature on the
+other), and identical responses for a bad password and a missing user.
 
 ## What is actually implemented
 
