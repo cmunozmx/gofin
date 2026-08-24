@@ -1,0 +1,196 @@
+{
+  "//": [
+    "Example gofin configuration. Copy it and edit:",
+    "",
+    "    cp gofin.example.json gofin.json",
+    "    ./gofin serve --dry-run      # prints the resolved config, starts nothing",
+    "    ./gofin serve",
+    "",
+    "gofin looks for ./gofin.json by default; -config or GOFIN_CONFIG picks",
+    "another path. Precedence is defaults, then this file, then GOFIN_* env vars,",
+    "then command-line flags -- each layer overriding the one before it. Only",
+    "flags you actually type override the file, so a flag left at its default",
+    "will not quietly replace a value set here.",
+    "",
+    "Every key below may be deleted; the built-in default then applies. Run",
+    "'./gofin config' to print the defaults with no commentary.",
+    "",
+    "Keys named \"//\" are comments. JSON has none, and gofin ignores unknown",
+    "keys, so this is the usual workaround rather than anything gofin-specific."
+  ],
+
+  "server": {
+    "//": [
+      "name           what clients display, and part of the server ID derivation,",
+      "               so renaming the server changes its ID -- pick one and keep it.",
+      "bind           0.0.0.0 for every interface, 127.0.0.1 to accept only local",
+      "               connections (use this when a reverse proxy sits in front).",
+      "port           8096 is the Jellyfin default and what clients probe first.",
+      "base_url       set only when served under a sub-path, e.g. \"/jellyfin\".",
+      "               A leading slash is added and a trailing one removed for you.",
+      "published_url  the externally reachable URL, when it differs from what the",
+      "               server sees. Clients are handed this for their own links.",
+      "               Leave empty to derive it from the request."
+    ],
+    "name": "Gofin",
+    "bind": "0.0.0.0",
+    "port": 8096,
+    "base_url": "",
+    "published_url": "",
+    "local_networks": [
+      "127.0.0.0/8",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ],
+    "autodiscovery": true
+  },
+
+  "paths": {
+    "//": [
+      "Server state, NOT media -- media lives in \"libraries\" below.",
+      "Relative paths resolve against the working directory; prefer absolute",
+      "paths when running under systemd, where that is not what you expect.",
+      "These directories are created at startup if missing.",
+      "",
+      "The JELLYFIN_DATA_DIR / JELLYFIN_CONFIG_DIR / JELLYFIN_CACHE_DIR /",
+      "JELLYFIN_LOG_DIR env vars also set these, so gofin drops into an",
+      "existing Jellyfin container without rewriting its environment."
+    ],
+    "data": "./data",
+    "config": "./config",
+    "cache": "./cache",
+    "logs": "./logs"
+  },
+
+  "libraries": [
+    {
+      "//": [
+        "Media roots. Each becomes one library in the client.",
+        "",
+        "name      what clients display. Defaults to the directory name.",
+        "          Must be unique, compared case-insensitively.",
+        "path      absolute path to the media root. Required. It must exist and",
+        "          be readable at startup or gofin exits rather than starting up",
+        "          and presenting an empty library.",
+        "type      movies, tvshows, music, musicvideos, homevideos, boxsets,",
+        "          books, or mixed. Omit or use \"\" for mixed content.",
+        "readonly  true keeps gofin from ever writing to the media root.",
+        "",
+        "readonly DEFAULTS TO TRUE when omitted. That is deliberate: the unsafe",
+        "value should never be the one you get by saying nothing. Set it to",
+        "false only when you want gofin writing into your media directories.",
+        "",
+        "Nothing in this build writes to media at all, so today readonly is a",
+        "statement of intent that becomes load-bearing once deletion and",
+        "metadata writeback exist. For a hard guarantee, mount the media",
+        "read-only as well -- a bind,ro mount is enforced by the kernel, which",
+        "no amount of application config can match.",
+        "",
+        "Libraries may not overlap: one root may not contain another, since",
+        "every file in the overlap would resolve twice under two different",
+        "parents and two different item IDs."
+      ],
+      "name": "Movies",
+      "path": "/mnt/alberca/Movies",
+      "type": "movies",
+      "readonly": true
+    },
+    {
+      "name": "Music",
+      "path": "/mnt/alberca/Music",
+      "type": "music",
+      "readonly": true
+    }
+  ],
+
+  "metadata": {
+    "//": [
+      "Artwork and metadata providers. OFF by default: a media server should",
+      "not start reaching the internet because a config file gained a field.",
+      "",
+      "TMDB (themoviedb.org) supplies movie posters. To turn it on you need",
+      "your OWN free API key:",
+      "",
+      "    1. sign up at https://www.themoviedb.org/signup",
+      "    2. request an API key at https://www.themoviedb.org/settings/api",
+      "    3. paste it into api_key below, set enabled to true, restart",
+      "",
+      "USE YOUR OWN KEY. Jellyfin ships a hardcoded one in its source and it is",
+      "deliberately not reused here: that key belongs to the Jellyfin project,",
+      "TMDB's terms require an application to use its own, and borrowing it",
+      "would risk getting THEIR key rate-limited by our traffic.",
+      "",
+      "The key is a credential. If you would rather not have it sit in a file",
+      "that gets copied around, leave api_key empty and set the environment",
+      "variable GOFIN_TMDB_API_KEY instead -- that also enables the provider.",
+      "",
+      "poster_size is a TMDB size bucket: w92, w154, w185, w342, w500, w780,",
+      "or original. w500 is the default here. Jellyfin defaults to original,",
+      "which for a large library means downloading many megabytes per film to",
+      "render a thumbnail a few hundred pixels wide.",
+      "",
+      "language is an ISO code like en-US, es-MX, ja-JP. It selects which",
+      "localised poster is preferred.",
+      "",
+      "Posters are written to <cache>/images/, NEVER next to your media -- a",
+      "readonly library stays untouched. Deleting that directory costs only",
+      "bandwidth. Titles TMDB cannot match get a .miss marker so they are not",
+      "looked up again on every restart; POST /Library/RefreshArtwork with",
+      "?retryMissed=true clears those after you rename the offending files."
+    ],
+    "tmdb": {
+      "enabled": false,
+      "api_key": "",
+      "language": "en-US",
+      "poster_size": "w500"
+    }
+  },
+
+  "users": [
+    {
+      "//": [
+        "password is a bootstrap convenience: it is hashed with PBKDF2-SHA512",
+        "when the config loads. It is NOT hashed in this file, so a config with",
+        "a plaintext password in it should be mode 0600 and should not be",
+        "committed anywhere.",
+        "",
+        "To avoid storing plaintext at all, put an already-hashed value in",
+        "password_hash instead and drop the password field. The format is",
+        "$PBKDF2-SHA512$iterations=N$<salt-hex>$<digest-hex>, and the iteration",
+        "count is read from the string rather than assumed -- so hashes exported",
+        "from an existing Jellyfin user table verify as they are.",
+        "",
+        "User IDs are derived from the name, so a user keeps the same ID across",
+        "restarts and across machines. Renaming a user changes their ID.",
+        "",
+        "CHANGE THIS PASSWORD before exposing the server to anything."
+      ],
+      "name": "admin",
+      "password": "changeme",
+      "password_hash": "",
+      "admin": true
+    }
+  ],
+
+  "web": {
+    "//": [
+      "Serve a jellyfin-web dist from disk. Leave disabled for an API-only",
+      "server; point dir at an unpacked jellyfin-web build to serve the UI too."
+    ],
+    "enabled": false,
+    "dir": ""
+  },
+
+  "logging": {
+    "//": [
+      "level   trace, debug, info, warn, or error. debug logs every request.",
+      "format  text for humans, json for a log collector.",
+      "",
+      "Every unimplemented endpoint logs itself at WARN, so browsing with a real",
+      "client at debug level produces a prioritized list of what to build next."
+    ],
+    "level": "info",
+    "format": "text"
+  }
+}
