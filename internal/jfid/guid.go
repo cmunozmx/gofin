@@ -15,6 +15,7 @@ package jfid
 
 import (
 	"crypto/md5"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -209,4 +210,45 @@ func NewItemID(path, typeName, programDataPath string, enc KeyEncoding) GUID {
 func ImageTag(path string, modifiedTicks int64, enc KeyEncoding) string {
 	sum := md5.Sum(encodeKey(fmt.Sprintf("%s%d", path, modifiedTicks), enc))
 	return hex.EncodeToString(sum[:])
+}
+
+// ---------------------------------------------------------------- database
+
+// Value implements driver.Valuer so a GUID can be passed straight to a SQL
+// query. It stores as the dashless string, which is what SQLite holds and what
+// upstream has stored since 10.10.
+func (g GUID) Value() (driver.Value, error) { return g.String(), nil }
+
+// Scan implements sql.Scanner so a GUID can be read straight out of a row.
+//
+// Without this, database/sql refuses a [16]byte destination outright --
+// "unsupported Scan, storing driver.Value type string into type *jfid.GUID" --
+// and every caller has to remember to convert by hand. Making the type itself
+// know how to round-trip removes the chance to forget.
+//
+// A NULL column scans to the zero GUID rather than an error: every caller
+// already treats the zero GUID as absent.
+func (g *GUID) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		*g = Nil
+		return nil
+	case string:
+		parsed, err := Parse(v)
+		if err != nil {
+			return fmt.Errorf("scan GUID from %q: %w", v, err)
+		}
+		*g = parsed
+		return nil
+	case []byte:
+		// SQLite hands TEXT back as []byte through some drivers.
+		parsed, err := Parse(string(v))
+		if err != nil {
+			return fmt.Errorf("scan GUID from %q: %w", v, err)
+		}
+		*g = parsed
+		return nil
+	default:
+		return fmt.Errorf("scan GUID: unsupported source type %T", src)
+	}
 }

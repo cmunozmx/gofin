@@ -152,3 +152,50 @@ func TestKnownItemIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestGUIDValueAndScan(t *testing.T) {
+	want := HashString("user:admin", UTF16LE)
+
+	v, err := want.Value()
+	if err != nil {
+		t.Fatalf("Value: %v", err)
+	}
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("Value returned %T, want string", v)
+	}
+	if s != want.String() {
+		t.Errorf("Value = %q, want %q", s, want.String())
+	}
+
+	// Both the string and []byte forms a SQLite driver may hand back, plus the
+	// dashed spelling a client might have stored.
+	for _, src := range []any{s, []byte(s), want.Dashed()} {
+		var got GUID
+		if err := got.Scan(src); err != nil {
+			t.Errorf("Scan(%T %v): %v", src, src, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("Scan(%T) = %v, want %v", src, got, want)
+		}
+	}
+
+	// NULL is absent, not an error.
+	var g GUID
+	if err := g.Scan(nil); err != nil {
+		t.Errorf("Scan(nil): %v", err)
+	}
+	if !g.IsZero() {
+		t.Errorf("Scan(nil) = %v, want zero", g)
+	}
+
+	// Garbage must be refused rather than silently becoming the zero GUID,
+	// which would collide with every other unparseable value.
+	if err := g.Scan("not a guid"); err == nil {
+		t.Error("Scan(garbage) succeeded, want error")
+	}
+	if err := g.Scan(42); err == nil {
+		t.Error("Scan(int) succeeded, want error")
+	}
+}
