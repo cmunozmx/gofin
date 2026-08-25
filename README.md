@@ -1,8 +1,12 @@
 # gofin — phase 0/1
 
 Jellyfin-wire-compatible media server. This tree is the *identity and protocol*
-layer: the parts where being wrong locks out every client at once, and which
-need no dependencies to get right.
+layer: the parts where being wrong locks out every client at once.
+
+It has exactly one dependency, `modernc.org/sqlite`, added when persistence
+landed. Everything else is the standard library. That driver is pure Go
+specifically so `CGO_ENABLED=0` still produces a static binary and `make dist`
+stays a single cross-compile.
 
 It builds, vets, and runs. The original draft was written without a Go
 toolchain; the only thing actually wrong with it was the file layout — every
@@ -112,8 +116,13 @@ them from configuration, and `/Items?ParentId=…` walks into real scanned media
 The scan runs in the background at startup — a large library would otherwise
 look like a server that hangs — and `POST /Library/Refresh` triggers a rescan.
 
-What is still missing is playback: nothing streams bytes yet, and nothing reads
-container metadata, so durations are absent.
+Playback works by direct play: `/Items/{id}/PlaybackInfo` answers how to play a
+file and `/Videos/{id}/stream` serves the bytes. There is no transcoding, so a
+client that cannot decode a given container is on its own.
+
+`RunTimeTicks` is still absent from item listings — `ffprobe` is consulted for
+`PlaybackInfo` and cached under `cache/probe/`, but `toItemDto` does not read
+that cache, so durations do not reach a browse response.
 
 Verify it is alive the way a client would:
 
@@ -164,7 +173,7 @@ go test ./...
 go test -race ./...     # the WebSocket write path is concurrent; this matters
 ```
 
-226 test functions, 411 cases with subtests, all passing and race-clean.
+272 test functions, 458 cases with subtests, all passing and race-clean.
 
 Where a value could be checked against something other than this code, it is.
 The PBKDF2-SHA512 known answers and the stored-hash fixtures come from Python's
@@ -202,7 +211,7 @@ other), and identical responses for a bad password and a missing user.
 | `/Users/AuthenticateByName`, `/Users/Me`, `/Users/Public` | complete, tested |
 | `/socket` handshake + `ForceKeepAlive` + `KeepAlive` | complete, tested |
 | `/UserViews`, `/Users/{id}/Views` — libraries appear in clients | complete, tested |
-| `/DisplayPreferences/{id}` — defaults, not persisted | partial, tested |
+| `/DisplayPreferences/{id}` — defaults; writes still discarded | partial, tested |
 | Subscription tickers (`Sessions`, `ScheduledTasksInfo`) | TODO, marked |
 | `jfnaming` — Emby.Naming port: titles, years, stacks, extras | complete, tested |
 | `jfscan` — movie + music scanner, ignore rules, symlink-loop safe | complete, tested |
@@ -211,8 +220,14 @@ other), and identical responses for a bad password and a missing user.
 | `/Items/Latest`, `/Items/Resume`, `/Items/Root` | complete, tested |
 | `/Items/{id}/Images/Primary` — local artwork, or fetched posters | complete, tested |
 | `jftmdb` — TMDB poster fetching, opt-in, own API key | complete, tested |
-| **Persistence — nothing is written to disk; see below** | **not started** |
-| Playback, streaming, transcoding, metadata providers | not started |
+| `jfdb` — SQLite: users, tokens, user data, display prefs | complete, tested |
+| Tokens and logins survive a restart | complete, tested |
+| Favourites, watched state, resume points | complete, tested |
+| `/Sessions/Logout`, `DELETE /Sessions/AccessToken` | complete, tested |
+| Display preferences — table exists, handlers not wired | not started |
+| Item repository in SQLite — still in memory, rescan on boot | not started |
+| Playback: direct play + byte-range streaming | complete, tested |
+| Transcoding, metadata providers beyond TMDB, TV episodes | not started |
 
 ## Porting Emby.Naming: why it is not a regex translation
 
@@ -309,7 +324,8 @@ How it behaves, and why:
   what keeps `readonly: true` honest. Deleting the directory costs only
   bandwidth.
 - **The cache is checked before the network**, at scan time — so a restart shows
-  artwork immediately. This is the first thing gofin persists across restarts.
+  artwork immediately. This was the first thing gofin persisted across restarts,
+  and it predates the database: posters are files on disk, not rows.
 - **Unmatched titles get a `.miss` marker**, because a library of scene releases
   has plenty and re-querying them on every boot is pure waste.
   `POST /Library/RefreshArtwork?retryMissed=true` clears them, which is what you
@@ -327,26 +343,60 @@ How it behaves, and why:
 The tests run against a fake TMDB served by `httptest`, so `go test` never
 touches the network and needs no key.
 
-## Nothing is persisted. There is no database.
+## Persistence
 
-`go.mod` has no dependencies, and no code imports `database/sql`. The
-`data/`, `config/` and `logs/` directories are created at startup and stay
-empty; `cache/images/` is the sole exception, holding downloaded posters. Every "SQLite" string in the tree is a comment marking where the
-real thing goes.
+There is a database: `data/gofin.db`, opened at startup by `internal/jfdb`.
+Four tables at `PRAGMA user_version` 1 — `users`, `devices`, `user_data`,
+`display_preferences`. WAL, `synchronous=NORMAL`, foreign keys on, and a pool
+capped at one connection so statements serialise and `SQLITE_BUSY` cannot
+happen. That pool size is also why every query defers `rows.Close()`: a leaked
+`rows` deadlocks the next caller rather than merely leaking.
 
-What that costs today:
+`--dry-run` returns before the database is opened, so printing the resolved
+config never creates the file as a side effect.
 
-- **Every restart re-scans.** Cheap here — about 3s cold, 12ms once the
-  directory entries are in page cache — but it is O(library) on every boot.
-- **Tokens die with the process.** Clients have to log in again after a restart.
-- **Nothing user-generated can survive**: playback position, favourites, watched
-  state, per-library display preferences. `/DisplayPreferences` accepts writes
-  and drops them, and `/Items/Resume` is empty for the same reason.
+What now survives a restart:
 
-The item store is deliberately shaped for the swap: `ItemStore` is replaced
-wholesale at the end of a scan, so it is already atomic, and the handlers only
-touch it through `Get`, `Children`, `Descendants` and `ChildCount`. Backing
-those four with SQLite does not change a single handler.
+- **Tokens.** Clients stay logged in. Because they outlive the process, there
+  is now a way to end one deliberately: `POST /Sessions/Logout`, and
+  `DELETE /Sessions/AccessToken` for an admin ending somebody else's session.
+- **Favourites, watched state and play counts**, via the `FavoriteItems` and
+  `PlayedItems` routes in both their spellings.
+- **Resume points.** The four `/Sessions/Playing*` routes used to read their
+  bodies into `io.Discard`; those bodies carry `ItemId` and `PositionTicks`,
+  which is the entire input for `/Items/Resume`. Stopping past 90% of an item's
+  runtime marks it played and clears the resume point so it leaves Continue
+  Watching.
+
+What still does not:
+
+- **Display preferences.** `POST /DisplayPreferences` still discards its body
+  and `GET` still serves hardcoded defaults, even though the table and its
+  repository methods exist and are tested. This is the last `io.Discard` sink.
+- **The item store.** `ItemStore` is still in memory, so every boot re-scans —
+  about 3s cold, 12ms once the directory entries are in page cache. It is
+  deliberately shaped for the swap: replaced wholesale at the end of a scan, so
+  already atomic, and reached only through `Get`, `Children`, `Descendants` and
+  `ChildCount`. That was left for later on purpose — a rescan is cheap, so the
+  item table buys much less than the user-data table and costs considerably
+  more, since it touches the atomic-swap semantics that keep a rescan invisible
+  to clients.
+
+### Users are declared in config, cached in the database
+
+`gofin.json` remains the source of truth for who exists; `seedUsers` upserts
+them on every boot. There is no user CRUD over HTTP, so a user is created,
+renamed or promoted by editing the config.
+
+Earlier versions kept the PBKDF2 salt stable by **rewriting `gofin.json`** with
+the computed hash. That is gone. It wrote to `defaultConfigPath()` rather than
+the `-config` path, so `-config other.json` silently edited `gofin.json`.
+The rule now: an explicit `password_hash` wins; otherwise a stored hash that
+still verifies against the configured plaintext is kept; otherwise the plaintext
+is hashed. Same stable salt, nothing written to your config file.
+
+Note `config/` and `logs/` are still created and still stay empty — the config
+file lives at `./gofin.json` (or `$GOFIN_CONFIG`), not inside `cfg.Paths.Config`.
 
 ## Caching
 
@@ -423,56 +473,44 @@ Storage is a private implementation detail — nothing about it is on the wire �
 so gofin does not have to match it. Matching the *derivation* is what preserves
 item IDs, and that is what `TestKnownItemIDs` checks.
 
-## Two bugs the tests surfaced, both still open
+## One bug the tests surfaced, still open
 
-Neither is fixed here, because both change what goes on the wire and that is a
-decision worth making deliberately rather than as a side effect of adding tests.
+**`jftime` is not on the timestamp path.** `internal/jftime` exists specifically
+so timestamps render the way .NET's serializer does — ISO-8601 with exactly
+seven fractional digits — and its own comment notes that some clients
+string-compare timestamps.
 
-**`jftime` is written but never used.** `internal/jftime` exists specifically so
-timestamps render the way .NET's serializer does — ISO-8601 with exactly seven
-fractional digits — and its own comment notes that some clients string-compare
-timestamps. But `main.go` does not import it. The DTOs declare `time.Time`, so
-the live server emits Go's default nanosecond precision:
+`main.go` does now import it, but only for `jfid.ImageTag`. The DTOs still
+declare `*time.Time` / `time.Time`, so the live server emits Go's default
+nanosecond precision:
 
 ```
 "LastActivityDate": "2026-08-24T15:47:46.916119508Z"   // 9 digits, not 7
 ```
 
-The fix is to change `LastLoginDate`, `LastActivityDate` and friends from
-`*time.Time` / `time.Time` to `jftime.Time`. Small, but it touches every
-timestamp on the wire, so do it before anything starts depending on the current
-shape. `jftime` itself is correct and tested — nothing is wrong except that it
-is not plugged in.
+The fix is to change `LastLoginDate`, `LastActivityDate` and friends to
+`jftime.Time`. Small, but it touches every timestamp on the wire, so do it
+before anything starts depending on the current shape. `jftime` itself is
+correct and tested — nothing is wrong except that the DTOs do not use it.
 
-**`problem()` builds a wrong `type` URL for non-4xx statuses.** It computes the
-RFC 9110 section as `status-399`, which is right for 4xx and nonsense for
-anything else. A 501 currently advertises:
-
-```
-"type": "https://tools.ietf.org/html/rfc9110#section-15.5.102"
-```
-
-There is no §15.5.102; 501 is §15.6.2. Clients parse `status` and `title`, not
-`type`, so nothing breaks today — but it is wrong in every 5xx response, which
-is precisely the set this build returns most often. Map status to section
-explicitly instead of doing arithmetic on it.
+**Fixed:** `problem()` used to compute the RFC 9110 section as `status-399`,
+right for 4xx and nonsense for everything else — a 501 advertised
+`section-15.5.102`, which does not exist. Status now maps to section explicitly.
 
 ## Next, in order
 
-0. Fix the two bugs above — both are cheap now and get more expensive once
-   anything depends on the current wire shape.
-1. Swap `Store` and `ItemStore` for SQLite (`modernc.org/sqlite`, pure Go, keeps
-   the static build). Upstream's schema is not binding — storage never reaches
-   the wire — but `jellyfin.db` is worth reading as a reference, and matching its
-   *item-ID derivation* is what an in-place migration depends on. `ItemStore` is
-   already shaped for this: it is replaced atomically and reached only through
-   `Get`, `Children`, `Descendants` and `ChildCount`.
-2. **Playback.** The largest remaining gap and the reason the library still
-   cannot be used: `/Items/{id}/PlaybackInfo`, then byte-range streaming from
-   `/Videos/{id}/stream` and `/Audio/{id}/stream`. Direct play first — no
-   transcoding — which covers most clients for most files.
-3. Container metadata via `ffprobe`, so `RunTimeTicks` stops being `null`.
-   Durations are what make a progress bar and resume points possible.
+0. Fix the `jftime` bug above — cheap now, more expensive once anything depends
+   on the current wire shape.
+1. **Wire display preferences.** The table and its four repository methods are
+   built and tested; two handlers need to read and write them, keyed on
+   `(user, prefs_id, client)`. The last `io.Discard` sink in the tree.
+2. **Handler tests for the new routes.** `internal/jfdb` has 43 of its own, but
+   favourites, played, resume, logout and the playback reporters have no
+   coverage at the HTTP layer. The one worth writing first is a round trip:
+   report progress, restart, confirm `/Items/Resume` returns the item.
+3. `RunTimeTicks` in item listings. `ffprobe` output is already cached under
+   `cache/probe/`; `toItemDto` just does not read it. Durations are what make a
+   progress bar work in a browse view.
 4. Generate the remaining handlers from a real server's
    `/api-docs/openapi.json` with `oapi-codegen`, so the compiler tracks what is
    left. `$JF` can produce the spec without a running server.
@@ -481,7 +519,12 @@ explicitly instead of doing arithmetic on it.
    `Emby.Naming/TV/` resolvers. `jfscan` currently treats a `tvshows` library as
    loose video files, which is honest but not useful.
 6. The WebSocket subscription tickers, so a client's dashboard stops waiting
-   forever for `ScheduledTasksInfo` that never arrives.
+   forever for `ScheduledTasksInfo` that never arrives. `GET /Sessions` also
+   still returns `[]` — there is no session registry, and `handleSocket` keeps
+   its connection on the goroutine stack rather than in one.
+7. The item store in SQLite, with an ancestors closure table so boot stops
+   re-scanning and `Descendants` becomes a join.
 
-Done since this list was written: `Emby.Naming` (step 3 of the original plan),
-the scanner and item repository (step 4), and library browsing.
+Done since this list was written: `Emby.Naming`, the scanner and item
+repository, library browsing, direct-play streaming, and SQLite persistence for
+users, tokens and user data.
