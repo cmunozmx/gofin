@@ -2099,7 +2099,7 @@ func TestUserItemsTopLevelReturnsLibraries(t *testing.T) {
 // result -- an empty library is true, an error dialog would not be.
 func TestUserItemsBelowLibraryIsEmptyNotAnError(t *testing.T) {
 	e := libEnv(t)
-	parent := e.srv.views()[0].ID.String()
+	parent := e.srv.views(nil)[0].ID.String()
 
 	for _, path := range []string{
 		"/Users/" + e.viewer.ID.String() + "/Items?ParentId=" + parent,

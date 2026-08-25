@@ -1084,7 +1084,7 @@ var mediaTypes = map[jfscan.Kind]string{
 }
 
 // toItemDto renders a scanned item for the wire.
-func (s *Server) toItemDto(it jfscan.Item) BaseItemDto {
+func (s *Server) toItemDto(it jfscan.Item, ud userData) BaseItemDto {
 	media := mediaTypes[it.Kind]
 	if media == "" {
 		media = "Unknown"
@@ -1121,10 +1121,7 @@ func (s *Server) toItemDto(it jfscan.Item) BaseItemDto {
 		RemoteTrailers:       []any{},
 		LockedFields:         []string{},
 		Artists:              []string{},
-		UserData: &UserItemDataDto{
-			Key:    it.ID.String(),
-			ItemID: it.ID,
-		},
+		UserData:             ud.dto(it.ID),
 	}
 	if it.Year > 0 {
 		y := it.Year
@@ -1150,6 +1147,43 @@ func (s *Server) toItemDto(it jfscan.Item) BaseItemDto {
 	// RunTimeTicks stays nil: nothing here probes container duration, and
 	// reporting 0 would make every item look zero-length.
 	return d
+}
+
+// userData is one user's state for every item they have touched, loaded once
+// per request.
+//
+// The alternative -- looking each item up while rendering it -- is a query per
+// row of a listing. Only items with state have a row, so this stays small even
+// for a large library.
+//
+// A nil map is valid and yields zero-valued entries, so an unauthenticated or
+// not-yet-loaded path still renders a correctly shaped response instead of
+// panicking.
+type userData map[jfid.GUID]jfdb.UserData
+
+// dto renders one item's state for the wire. Clients expect the object to be
+// present and shaped even for a folder that can have no playback state.
+func (u userData) dto(id jfid.GUID) *UserItemDataDto {
+	d := &UserItemDataDto{Key: id.String(), ItemID: id}
+	if s, ok := u[id]; ok {
+		d.PlaybackPositionTicks = s.PlaybackPositionTicks
+		d.PlayCount = s.PlayCount
+		d.IsFavorite = s.IsFavorite
+		d.Played = s.Played
+	}
+	return d
+}
+
+// userDataFor loads a user's state, logging and degrading to an empty set on
+// failure. A database hiccup should cost the watched ticks on a listing, not
+// the listing itself.
+func (s *Server) userDataFor(id jfid.GUID) userData {
+	ud, err := s.store.UserDataFor(id)
+	if err != nil {
+		s.log.Error("loading user data", "user", id.String(), "err", err)
+		return nil
+	}
+	return ud
 }
 
 // UserItemDataDto carries per-user playback state. A library folder has none of
@@ -1234,7 +1268,7 @@ func (l Library) ID(dataDir string) jfid.GUID {
 
 // toViewDto renders one configured library as the CollectionFolder a client
 // shows in its sidebar.
-func (s *Server) toViewDto(l Library) BaseItemDto {
+func (s *Server) toViewDto(l Library, ud userData) BaseItemDto {
 	id := l.ID(s.cfg.Paths.Data)
 	return BaseItemDto{
 		Name:           l.Name,
@@ -1268,17 +1302,14 @@ func (s *Server) toViewDto(l Library) BaseItemDto {
 		ExternalUrls:      []any{},
 		RemoteTrailers:    []any{},
 		LockedFields:      []string{},
-		UserData: &UserItemDataDto{
-			Key:    id.String(),
-			ItemID: id,
-		},
+		UserData:          ud.dto(id),
 	}
 }
 
-func (s *Server) views() []BaseItemDto {
+func (s *Server) views(ud userData) []BaseItemDto {
 	out := make([]BaseItemDto, 0, len(s.cfg.Libraries))
 	for _, l := range s.cfg.Libraries {
-		out = append(out, s.toViewDto(l))
+		out = append(out, s.toViewDto(l, ud))
 	}
 	return out
 }
@@ -1587,18 +1618,43 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc(p, s.handleStream)
 	}
 
-	// Playback state reporting. Nothing is stored -- there is no database -- but
-	// these must not error: a client that cannot report progress may refuse to
-	// start, and it will retry a failing call for the whole of playback.
+	// Playback state reporting. These now persist, but they keep their old
+	// contract of never returning an error: a client that cannot report
+	// progress may refuse to start playback, and it will retry a failing call
+	// for the whole of playback. A write failure is logged and still answered
+	// 204.
+	mux.HandleFunc("POST /Sessions/Playing", s.authenticate(s.handlePlaybackStart, false))
+	mux.HandleFunc("POST /Sessions/Playing/Progress", s.authenticate(s.handlePlaybackProgress, false))
+	mux.HandleFunc("POST /Sessions/Playing/Stopped", s.authenticate(s.handlePlaybackStopped, false))
+	mux.HandleFunc("POST /Sessions/Playing/Ping", s.authenticate(s.handlePlaybackPing, false))
+
+	// Marking watched and favourited. Both spellings of each: Delfin and other
+	// established clients use the legacy per-user paths, newer ones do not.
 	for _, p := range []string{
-		"POST /Sessions/Playing", "POST /Sessions/Playing/Progress",
-		"POST /Sessions/Playing/Stopped", "POST /Sessions/Playing/Ping",
+		"POST /Users/{userId}/FavoriteItems/{itemId}", "POST /UserFavoriteItems/{itemId}",
 	} {
-		mux.HandleFunc(p, s.authenticate(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
-			w.WriteHeader(http.StatusNoContent)
-		}, false))
+		mux.HandleFunc(p, s.authenticate(s.handleSetFavorite(true), false))
 	}
+	for _, p := range []string{
+		"DELETE /Users/{userId}/FavoriteItems/{itemId}", "DELETE /UserFavoriteItems/{itemId}",
+	} {
+		mux.HandleFunc(p, s.authenticate(s.handleSetFavorite(false), false))
+	}
+	for _, p := range []string{
+		"POST /Users/{userId}/PlayedItems/{itemId}", "POST /UserPlayedItems/{itemId}",
+	} {
+		mux.HandleFunc(p, s.authenticate(s.handleSetPlayed(true), false))
+	}
+	for _, p := range []string{
+		"DELETE /Users/{userId}/PlayedItems/{itemId}", "DELETE /UserPlayedItems/{itemId}",
+	} {
+		mux.HandleFunc(p, s.authenticate(s.handleSetPlayed(false), false))
+	}
+
+	// Logging out. Tokens outlive the process now, so there has to be a way to
+	// end one deliberately.
+	mux.HandleFunc("POST /Sessions/Logout", s.authenticate(s.handleLogout, false))
+	mux.HandleFunc("DELETE /Sessions/AccessToken", s.authenticate(s.handleRevokeToken, true))
 
 	// Artwork. Unauthenticated on purpose: these URLs go straight into <img>
 	// tags, which cannot set an Authorization header, and upstream serves them
@@ -1712,11 +1768,12 @@ func (s *Server) requestedUser(r *http.Request) (*User, bool) {
 }
 
 func (s *Server) handleUserViews(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requestedUser(r); !ok {
+	user, ok := s.requestedUser(r)
+	if !ok {
 		problem(w, http.StatusForbidden, "Forbidden")
 		return
 	}
-	views := s.views()
+	views := s.views(s.userDataFor(user.ID))
 	writeJSON(w, 200, QueryResult[BaseItemDto]{
 		Items:            views,
 		TotalRecordCount: len(views),
@@ -1732,10 +1789,12 @@ func (s *Server) handleUserViews(w http.ResponseWriter, r *http.Request) {
 // library, which is true, instead of an error dialog, which would be
 // misleading. The WARN keeps the gap visible in the log.
 func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requestedUser(r); !ok {
+	user, ok := s.requestedUser(r)
+	if !ok {
 		problem(w, http.StatusForbidden, "Forbidden")
 		return
 	}
+	ud := s.userDataFor(user.ID)
 
 	q := r.URL.Query()
 	raw := q.Get("ParentId")
@@ -1745,7 +1804,7 @@ func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 
 	// No parent means the top level, which is the set of libraries.
 	if raw == "" {
-		views := s.views()
+		views := s.views(ud)
 		writeJSON(w, 200, QueryResult[BaseItemDto]{
 			Items:            views,
 			TotalRecordCount: len(views),
@@ -1763,7 +1822,7 @@ func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 	children := s.items.Children(parent)
 	items := make([]BaseItemDto, 0, len(children))
 	for _, c := range children {
-		items = append(items, s.toItemDto(c))
+		items = append(items, s.toItemDto(c, ud))
 	}
 
 	total := len(items)
@@ -1806,10 +1865,12 @@ func startIndex(q url.Values) int {
 // It returns a BARE ARRAY, not a QueryResult -- upstream is inconsistent here,
 // and a client handed {"Items":[...]} for this endpoint renders nothing.
 func (s *Server) handleLatestItems(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requestedUser(r); !ok {
+	user, ok := s.requestedUser(r)
+	if !ok {
 		problem(w, http.StatusForbidden, "Forbidden")
 		return
 	}
+	ud := s.userDataFor(user.ID)
 	q := r.URL.Query()
 
 	var pool []jfscan.Item
@@ -1841,20 +1902,255 @@ func (s *Server) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]BaseItemDto, 0, len(media))
 	for _, it := range media {
-		out = append(out, s.toItemDto(it))
+		out = append(out, s.toItemDto(it, ud))
 	}
 	writeJSON(w, 200, out)
 }
 
-// handleResumeItems answers "Continue Watching". Nothing records playback
-// position yet, so the honest answer is an empty result.
+// ------------------------------------------------------- playback reporting
+
+// playbackReport is the shared shape of the /Sessions/Playing* bodies. Clients
+// send supersets of this; the fields not named here are ignored.
+type playbackReport struct {
+	ItemID        jfid.GUID `json:"ItemId"`
+	PositionTicks int64     `json:"PositionTicks"`
+	IsPaused      bool      `json:"IsPaused"`
+	PlaySessionID string    `json:"PlaySessionId"`
+}
+
+// decodePlaybackReport reads the body and reports whether it named an item.
+//
+// It never fails the request. A malformed progress report is worth a log line,
+// not a non-2xx that a client will retry for the rest of the film.
+func (s *Server) decodePlaybackReport(r *http.Request) (playbackReport, bool) {
+	var rep playbackReport
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&rep); err != nil {
+		s.log.Warn("malformed playback report", "path", r.URL.Path, "err", err)
+		return rep, false
+	}
+	return rep, !rep.ItemID.IsZero()
+}
+
+// completionRatio is how far into an item counts as "watched" on stop.
+// Upstream uses 90%; the last few minutes are credits.
+const completionRatio = 0.9
+
+func (s *Server) handlePlaybackStart(w http.ResponseWriter, r *http.Request) {
+	a := authFrom(r)
+	if rep, ok := s.decodePlaybackReport(r); ok {
+		if err := s.store.SetProgress(a.User.ID, rep.ItemID, rep.PositionTicks, time.Now().UTC()); err != nil {
+			s.log.Error("playback start", "err", err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handlePlaybackProgress(w http.ResponseWriter, r *http.Request) {
+	a := authFrom(r)
+	if rep, ok := s.decodePlaybackReport(r); ok {
+		if err := s.store.SetProgress(a.User.ID, rep.ItemID, rep.PositionTicks, time.Now().UTC()); err != nil {
+			s.log.Error("playback progress", "err", err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePlaybackStopped writes the final position, and marks the item watched
+// if the user got near enough to the end.
+//
+// Runtime comes from the probe cache, so an item that has never been probed
+// cannot be auto-completed -- it keeps its resume point instead, which is the
+// safe way to be wrong.
+func (s *Server) handlePlaybackStopped(w http.ResponseWriter, r *http.Request) {
+	a := authFrom(r)
+	rep, ok := s.decodePlaybackReport(r)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	now := time.Now().UTC()
+
+	if runtime := s.runtimeTicks(rep.ItemID); runtime > 0 &&
+		float64(rep.PositionTicks) >= float64(runtime)*completionRatio {
+		// Finished: count the play and clear the resume point, so it stops
+		// appearing in Continue Watching.
+		if err := s.store.SetProgress(a.User.ID, rep.ItemID, 0, now); err != nil {
+			s.log.Error("clearing resume point", "err", err)
+		}
+		if err := s.store.SetPlayed(a.User.ID, rep.ItemID, true, now); err != nil {
+			s.log.Error("marking played", "err", err)
+		}
+	} else if err := s.store.SetProgress(a.User.ID, rep.ItemID, rep.PositionTicks, now); err != nil {
+		s.log.Error("playback stopped", "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePlaybackPing is the client saying it is still alive. There is nothing
+// to record but the token's activity.
+func (s *Server) handlePlaybackPing(w http.ResponseWriter, r *http.Request) {
+	a := authFrom(r)
+	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+	if a.Token != nil {
+		if err := s.store.TouchActivity(a.Token.Value, time.Now().UTC()); err != nil {
+			s.log.Error("touch activity", "err", err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// runtimeTicks reports an item's duration in .NET ticks, or 0 when it is not
+// known.
+//
+// Reads the probe cache directly rather than going through mediaInfoFor, which
+// falls back to running ffprobe: this is on the playback-stopped path, and a
+// client reporting the end of a film must not wait on a subprocess. An unprobed
+// item simply keeps its resume point instead of being auto-completed, which is
+// the safe way to be wrong.
+func (s *Server) runtimeTicks(id jfid.GUID) int64 {
+	b, err := os.ReadFile(s.probeCachePath(id))
+	if err != nil {
+		return 0
+	}
+	var info jfprobe.MediaInfo
+	if err := json.Unmarshal(b, &info); err != nil || info.Duration <= 0 {
+		return 0
+	}
+	return int64(info.Duration / 100) // time.Duration is ns; ticks are 100ns
+}
+
+// ---------------------------------------------------- favourites and watched
+
+// itemFromPath resolves the {itemId} path value, answering the client directly
+// on failure.
+func itemFromPath(w http.ResponseWriter, r *http.Request) (jfid.GUID, bool) {
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return jfid.Nil, false
+	}
+	return id, true
+}
+
+// writeUserData answers with an item's state after a change. Clients use the
+// response to update the row in place rather than refetching the listing.
+func (s *Server) writeUserData(w http.ResponseWriter, userID, itemID jfid.GUID) {
+	d, err := s.store.UserDataItem(userID, itemID)
+	if err != nil {
+		s.log.Error("reading back user data", "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
+	writeJSON(w, 200, userData{itemID: d}.dto(itemID))
+}
+
+func (s *Server) handleSetFavorite(favorite bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, ok := s.requestedUser(r)
+		if !ok {
+			problem(w, http.StatusForbidden, "Forbidden")
+			return
+		}
+		id, ok := itemFromPath(w, r)
+		if !ok {
+			return
+		}
+		if err := s.store.SetFavorite(user.ID, id, favorite); err != nil {
+			s.log.Error("set favorite", "err", err)
+			problem(w, http.StatusInternalServerError, "Internal error")
+			return
+		}
+		s.writeUserData(w, user.ID, id)
+	}
+}
+
+func (s *Server) handleSetPlayed(played bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, ok := s.requestedUser(r)
+		if !ok {
+			problem(w, http.StatusForbidden, "Forbidden")
+			return
+		}
+		id, ok := itemFromPath(w, r)
+		if !ok {
+			return
+		}
+		if err := s.store.SetPlayed(user.ID, id, played, time.Now().UTC()); err != nil {
+			s.log.Error("set played", "err", err)
+			problem(w, http.StatusInternalServerError, "Internal error")
+			return
+		}
+		s.writeUserData(w, user.ID, id)
+	}
+}
+
+// ---------------------------------------------------------------- logging out
+
+// handleLogout revokes the token the caller presented.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	a := authFrom(r)
+	if a.Token != nil {
+		if err := s.store.RevokeToken(a.Token.Value); err != nil {
+			s.log.Error("logout", "err", err)
+			problem(w, http.StatusInternalServerError, "Internal error")
+			return
+		}
+		s.log.Info("logout", "user", a.User.Name, "client", a.Token.Client)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRevokeToken revokes a named token. Admin only: this ends somebody
+// else's session.
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	value := r.URL.Query().Get("Id")
+	if value == "" {
+		problem(w, http.StatusBadRequest, "Missing token id")
+		return
+	}
+	if err := s.store.RevokeToken(value); err != nil {
+		s.log.Error("revoke token", "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleResumeItems answers "Continue Watching": started but not finished,
+// most recently played first.
 func (s *Server) handleResumeItems(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requestedUser(r); !ok {
+	user, ok := s.requestedUser(r)
+	if !ok {
 		problem(w, http.StatusForbidden, "Forbidden")
 		return
 	}
+
+	limit := 0 // no limit
+	if n, err := strconv.Atoi(r.URL.Query().Get("Limit")); err == nil && n > 0 {
+		limit = n
+	}
+
+	resume, err := s.store.ResumeItems(user.ID, limit)
+	if err != nil {
+		s.log.Error("resume items", "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
+
+	ud := s.userDataFor(user.ID)
+	items := make([]BaseItemDto, 0, len(resume))
+	for _, d := range resume {
+		// A row can outlive its item -- a rescan renamed the file, or the
+		// library was removed. Skipping is the expected outcome, not an error.
+		it, ok := s.items.Get(d.ItemID)
+		if !ok {
+			continue
+		}
+		items = append(items, s.toItemDto(it, ud))
+	}
+
 	writeJSON(w, 200, QueryResult[BaseItemDto]{
-		Items: []BaseItemDto{}, TotalRecordCount: 0, StartIndex: 0,
+		Items: items, TotalRecordCount: len(items), StartIndex: 0,
 	})
 }
 
@@ -2290,7 +2586,8 @@ func contentType(container string) string {
 // page, and a library root has to resolve here too -- it is the item the
 // browse view was opened from.
 func (s *Server) handleItemByID(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requestedUser(r); !ok {
+	user, ok := s.requestedUser(r)
+	if !ok {
 		problem(w, http.StatusForbidden, "Forbidden")
 		return
 	}
@@ -2299,15 +2596,16 @@ func (s *Server) handleItemByID(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "Malformed item id")
 		return
 	}
+	ud := s.userDataFor(user.ID)
 
 	if it, ok := s.items.Get(id); ok {
-		writeJSON(w, 200, s.toItemDto(it))
+		writeJSON(w, 200, s.toItemDto(it, ud))
 		return
 	}
 	// A library root is not in the item store; it is built from configuration.
 	for _, l := range s.cfg.Libraries {
 		if l.ID(s.cfg.Paths.Data) == id {
-			writeJSON(w, 200, s.toViewDto(l))
+			writeJSON(w, 200, s.toViewDto(l, ud))
 			return
 		}
 	}
