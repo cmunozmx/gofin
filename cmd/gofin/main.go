@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -1633,6 +1635,14 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc(p, s.handleStream)
 	}
 
+	// Same reasoning as the stream endpoints: not behind s.authenticate, for the
+	// same players that cannot set an Authorization header. The last segment is
+	// captured whole ("Stream.{format}" is not a legal wildcard) and split in
+	// the handler; {mediaSourceId} is unused since gofin has exactly one media
+	// source per item, but the segment is accepted to match upstream's route
+	// shape.
+	mux.HandleFunc("GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/{file}", s.handleSubtitle)
+
 	// Playback state reporting. These now persist, but they keep their old
 	// contract of never returning an error: a client that cannot report
 	// progress may refuse to start playback, and it will retry a failing call
@@ -2306,6 +2316,15 @@ type MediaStreamDto struct {
 	BitRate            int    `json:"BitRate,omitempty"`
 	PixelFormat        string `json:"PixelFormat,omitempty"`
 	Level              int    `json:"Level,omitempty"`
+	// DeliveryMethod and DeliveryUrl are nullable upstream
+	// (MediaBrowser.Model.Entities.MediaStream), but the KEY is always present
+	// in a real response. A client that requires the key -- Delfin's subtitle
+	// module does -- fails to decode the entire PlaybackInfo response, not just
+	// the subtitle track, when the key is missing. So these are never
+	// `omitempty`: DeliveryMethod is nil (-> JSON null) for anything that is
+	// not a subtitle, and DeliveryUrl is "" rather than an absent key.
+	DeliveryMethod *string `json:"DeliveryMethod"`
+	DeliveryUrl    string  `json:"DeliveryUrl"`
 }
 
 // MediaSourceInfo tells a client how it may play an item. Without one, a client
@@ -2443,6 +2462,21 @@ func (s *Server) mediaSource(it jfscan.Item) MediaSourceInfo {
 				PixelFormat:        st.PixelFormat,
 				SupportsExternalSt: st.Type == "Subtitle",
 				IsTextSubtitleStr:  st.Type == "Subtitle" && isTextSubtitle(st.Codec),
+			}
+			// Text subtitles are embedded in the container gofin serves
+			// byte-for-byte at /Videos/{id}/stream, so most players demux them
+			// on their own during direct play. Some do not -- particularly
+			// ones built around a fetch-a-track model -- so upstream also
+			// offers every text track as its own resource
+			// (SubtitleDeliveryMethod.External in
+			// MediaBrowser.Model.Dlna.SubtitleDeliveryMethod). handleSubtitle
+			// extracts it with ffmpeg on request; a player that reads the
+			// container itself can ignore the URL entirely.
+			if d.IsTextSubtitleStr {
+				method := "External"
+				d.DeliveryMethod = &method
+				d.DeliveryUrl = fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.vtt",
+					it.ID.String(), it.ID.String(), st.Index)
 			}
 			src.MediaStreams = append(src.MediaStreams, d)
 			if src.DefaultAudioStream == nil && st.Type == "Audio" && st.IsDefault {
@@ -2608,6 +2642,90 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Debug("streaming", "item", it.Name, "range", r.Header.Get("Range"))
 	http.ServeContent(w, r, filepath.Base(it.Path), fi.ModTime(), f)
+}
+
+// ffmpegAvailable reports whether ffmpeg can be run at all. Checked lazily
+// rather than at startup, matching jfprobe.Available: a missing binary
+// degrades one feature instead of failing the whole server to start.
+func ffmpegAvailable() bool {
+	_, err := exec.LookPath("ffmpeg")
+	return err == nil
+}
+
+// subtitleExtractTimeout bounds the ffmpeg subprocess. Extracting a text track
+// is a remux, not a decode, so this is generous headroom rather than an
+// expected duration.
+const subtitleExtractTimeout = 30 * time.Second
+
+// handleSubtitle extracts one embedded text subtitle track and serves it as
+// WebVTT.
+//
+// This exists because a container track a player can already demux for itself
+// during direct play is not always one it WILL: some clients only look for
+// subtitles at the URL PlaybackInfo's DeliveryUrl names, per
+// SubtitleDeliveryMethod.External, and never inspect the video container's own
+// subtitle streams. Without this route that DeliveryUrl points at nothing.
+func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || index < 0 {
+		problem(w, http.StatusBadRequest, "Malformed stream index")
+		return
+	}
+	// The last segment is "Stream.vtt" or similar; gofin only ever emits a
+	// .vtt DeliveryUrl, but a differently-suffixed request is answered the
+	// same way rather than rejected -- WebVTT is what every browser and every
+	// player that speaks HTML5 <track> understands, so it is what this always
+	// produces regardless of the extension asked for.
+	_ = r.PathValue("file")
+
+	it, ok := s.items.Get(id)
+	if !ok || it.IsFolder {
+		problem(w, http.StatusNotFound, "Item not found")
+		return
+	}
+	if !ffmpegAvailable() {
+		s.log.Warn("subtitle extraction requested but ffmpeg is not installed")
+		problem(w, http.StatusNotFound, "Subtitle extraction unavailable")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), subtitleExtractTimeout)
+	defer cancel()
+
+	// -map 0:N selects the Nth stream of the input by its ffprobe/ffmpeg global
+	// index, which is exactly what jfprobe.Stream.Index already is -- the two
+	// are the same numbering by construction (internal/jfprobe/probe.go).
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-v", "error",
+		"-i", it.Path,
+		"-map", fmt.Sprintf("0:%d", index),
+		"-f", "webvtt",
+		"-")
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	// Buffered rather than streamed: a text track is at most a few hundred KB,
+	// so holding it in memory costs nothing, and it means a bad index -- e.g. a
+	// file that changed on disk after it was scanned -- can still answer 404
+	// instead of committing a 200 with an empty body that a client cannot tell
+	// apart from "no subtitles".
+	if err := cmd.Run(); err != nil {
+		s.log.Warn("ffmpeg subtitle extraction", "item", it.Name, "index", index,
+			"err", err, "stderr", strings.TrimSpace(stderr.String()))
+		problem(w, http.StatusNotFound, "Subtitle track unavailable")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	// Never cache: nothing here is versioned, and re-running ffmpeg on request
+	// is cheap for a text track.
+	_, _ = w.Write(out.Bytes())
 }
 
 // contentType maps a container to a MIME type. Getting this wrong makes some

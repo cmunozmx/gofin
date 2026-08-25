@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"gofin/internal/jfauth"
 	"gofin/internal/jfdb"
 	"gofin/internal/jfid"
+	"gofin/internal/jfprobe"
 	"gofin/internal/jfscan"
 	"gofin/internal/jftmdb"
 )
@@ -1013,6 +1015,172 @@ func TestSessionsReturnsEmptyArray(t *testing.T) {
 	w := e.do(t, "GET", "/Sessions", e.tokenFor(e.viewer), nil)
 	if strings.TrimSpace(w.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", w.Body)
+	}
+}
+
+// ------------------------------------------------------- subtitle delivery
+
+// A real Delfin session reported:
+//
+//	WARN delfin::video_player::controls::subtitles Error getting playback info:
+//	error decoding response body
+//
+// MediaStreamDto had no DeliveryMethod/DeliveryUrl fields at all, so Go's
+// encoding/json never emitted those keys. If a client's MediaStreamInfo struct
+// declares them without a default, decoding the ENTIRE PlaybackInfo response
+// fails the moment a subtitle track is present -- not just the subtitle info,
+// the whole response, which is exactly what "error decoding response body"
+// describes. This pins that the key is always present, unlike upstream's own
+// omission that caused it.
+func TestMediaStreamDeliveryFieldsAlwaysPresent(t *testing.T) {
+	for _, d := range []MediaStreamDto{
+		{Type: "Video"}, // no delivery info at all
+		{Type: "Subtitle", DeliveryMethod: ptr("External"), DeliveryUrl: "/x"}, // has it
+	} {
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if _, ok := raw["DeliveryMethod"]; !ok {
+			t.Errorf("%s: DeliveryMethod key is absent, want present (possibly null)", b)
+		}
+		if _, ok := raw["DeliveryUrl"]; !ok {
+			t.Errorf("%s: DeliveryUrl key is absent, want present (possibly empty)", b)
+		}
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestHandleSubtitleRejectsMalformedInput(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.tokenFor(e.admin)
+
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/Videos/not-a-guid/not-a-guid/Subtitles/0/Stream.vtt", 400},
+		{"/Videos/" + jfid.Nil.String() + "/" + jfid.Nil.String() + "/Subtitles/0/Stream.vtt", 404}, // unknown item
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			w := e.do(t, "GET", c.path, token, nil)
+			if w.Code != c.want {
+				t.Errorf("status = %d, want %d (body: %s)", w.Code, c.want, w.Body)
+			}
+		})
+	}
+}
+
+// TestHandleSubtitleExtractsRealTrack is an end-to-end proof: build an actual
+// small MKV with a burned-in text subtitle stream via ffmpeg, scan it, and
+// fetch the DeliveryUrl PlaybackInfo advertises for it, exactly as a client
+// would after the fix above.
+//
+// Skips if ffmpeg is not on PATH, matching the project's own degrade-not-fail
+// policy for optional tooling (jfprobe.Available).
+func TestHandleSubtitleExtractsRealTrack(t *testing.T) {
+	if !ffmpegAvailable() {
+		t.Skip("ffmpeg not on PATH")
+	}
+	if !jfprobe.Available() {
+		t.Skip("ffprobe not on PATH")
+	}
+
+	root := t.TempDir()
+	movies := filepath.Join(root, "Movies")
+	if err := os.MkdirAll(movies, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	video := filepath.Join(movies, "Test Movie (2024).mkv")
+
+	srt := filepath.Join(root, "track.srt")
+	if err := os.WriteFile(srt, []byte("1\n00:00:00,000 --> 00:00:01,000\nHello\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("ffmpeg", "-y",
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+		"-i", srt,
+		"-c:v", "libx264", "-c:s", "srt",
+		"-t", "1", video)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building test fixture: %v\n%s", err, out)
+	}
+
+	e := newTestEnv(t)
+	libs, err := normalizeLibraries([]Library{{Name: "Movies", Path: movies, Type: "movies"}}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Libraries = libs
+	e.srv.cfg.Paths.Data = filepath.Join(root, "data")
+	e.srv.cfg.Paths.Cache = filepath.Join(root, "cache")
+	e.handler = e.srv.routes()
+	e.srv.scanLibraries()
+
+	token := e.tokenFor(e.viewer)
+	w := e.do(t, "GET", "/Users/"+e.viewer.ID.String()+"/Items", token, nil)
+	var listing QueryResult[BaseItemDto]
+	decodeJSON(t, w, &listing)
+	var lib BaseItemDto
+	for _, it := range listing.Items {
+		if it.Name == "Movies" {
+			lib = it
+		}
+	}
+	if lib.ID.IsZero() {
+		t.Fatalf("library not found in %+v", listing.Items)
+	}
+
+	w = e.do(t, "GET", "/Users/"+e.viewer.ID.String()+"/Items?ParentId="+lib.ID.String(), token, nil)
+	var children QueryResult[BaseItemDto]
+	decodeJSON(t, w, &children)
+	if len(children.Items) != 1 {
+		t.Fatalf("got %d items, want 1: %+v", len(children.Items), children.Items)
+	}
+	item := children.Items[0]
+
+	w = e.do(t, "POST", "/Items/"+item.ID.String()+"/PlaybackInfo", token, strings.NewReader("{}"))
+	var pb PlaybackInfoResponse
+	decodeJSON(t, w, &pb)
+	if len(pb.MediaSources) != 1 {
+		t.Fatalf("got %d media sources, want 1", len(pb.MediaSources))
+	}
+
+	var subURL string
+	for _, ms := range pb.MediaSources[0].MediaStreams {
+		if ms.Type == "Subtitle" {
+			if ms.DeliveryMethod == nil || *ms.DeliveryMethod != "External" {
+				t.Errorf("subtitle DeliveryMethod = %v, want External", ms.DeliveryMethod)
+			}
+			subURL = ms.DeliveryUrl
+		}
+	}
+	if subURL == "" {
+		t.Fatal("no subtitle stream in PlaybackInfo -- ffprobe may not have detected the srt track")
+	}
+
+	// The route is unauthenticated, matching /Videos/{id}/stream: a player
+	// fetching a <track> src cannot always attach an Authorization header.
+	w = e.do(t, "GET", subURL, "", nil)
+	if w.Code != 200 {
+		t.Fatalf("GET %s: status = %d, body = %s", subURL, w.Code, w.Body)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/vtt") {
+		t.Errorf("Content-Type = %q, want text/vtt", ct)
+	}
+	body := w.Body.String()
+	if !strings.HasPrefix(body, "WEBVTT") {
+		t.Errorf("body does not start with WEBVTT: %q", body)
+	}
+	if !strings.Contains(body, "Hello") {
+		t.Errorf("extracted subtitle lost its text: %q", body)
 	}
 }
 
