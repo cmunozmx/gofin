@@ -245,6 +245,53 @@ func TestSortNameDropsLeadingArticle(t *testing.T) {
 }
 
 // A symlink pointing back up must not turn the scan into a hang.
+// A symlinked film folder is still a film folder. Libraries are often
+// assembled out of links to media living on another volume, and os.ReadDir
+// reports a link as a link rather than as the directory it points at.
+func TestScanFollowsSymlinkedMovieDirectory(t *testing.T) {
+	root := tree(t,
+		"Movies/Arrival (2016) [1080p]/arrival.2016.mkv",
+		"media/Creep 2 (2017) [1080p] [WEBRip] [5.1] [YTS.MX]/Creep.2.2017.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4",
+	)
+	link := filepath.Join(root, "Movies", "Creep 2 (2017) [1080p]")
+	if err := os.Symlink(filepath.Join(root, "media", "Creep 2 (2017) [1080p] [WEBRip] [5.1] [YTS.MX]"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	res := scanMovies(t, filepath.Join(root, "Movies"))
+	items := byName(res)
+
+	// The link's own name is the clean one, so it wins the title just as a
+	// real directory's would -- not the scene name of the file inside it.
+	it, ok := items["Creep 2"]
+	if !ok {
+		t.Fatalf("the symlinked movie is missing; got %v", keys(items))
+	}
+	if it.Year != 2017 {
+		t.Errorf("Year = %d, want 2017", it.Year)
+	}
+	if it.Container != "mp4" {
+		t.Errorf("Container = %q, want mp4", it.Container)
+	}
+	if _, ok := items["Arrival"]; !ok {
+		t.Errorf("the plain directory should still scan; got %v", keys(items))
+	}
+}
+
+// A symlink pointing at a directory already scanned under its real name must
+// not produce the film twice.
+func TestScanDoesNotDuplicateAliasedDirectory(t *testing.T) {
+	root := tree(t, "Movies/Arrival (2016)/arrival.2016.mkv")
+	if err := os.Symlink(filepath.Join(root, "Movies", "Arrival (2016)"), filepath.Join(root, "Movies", "Arrival alias")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	res := scanMovies(t, filepath.Join(root, "Movies"))
+	if len(res.Items) != 1 {
+		t.Errorf("got %d items, want 1: %v", len(res.Items), names(res))
+	}
+}
+
 func TestScanSurvivesSymlinkLoop(t *testing.T) {
 	root := tree(t, "Movies/Arrival (2016).mkv")
 	loop := filepath.Join(root, "Movies", "loop")

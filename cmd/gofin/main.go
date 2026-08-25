@@ -1377,9 +1377,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // problem writes ASP.NET-shaped ProblemDetails, which is what clients parse on
 // error paths.
+// rfc9110Sections maps a status to its section in RFC 9110. The previous
+// version computed it as status-399, which is right for 4xx and nonsense for
+// everything else: a 501 advertised section-15.5.102, which does not exist.
+// Clients read status and title rather than type, so nothing broke -- but it
+// was wrong in every 5xx response, which is the set this build returns most.
+var rfc9110Sections = map[int]string{
+	400: "15.5.1", 401: "15.5.2", 403: "15.5.4", 404: "15.5.5",
+	405: "15.5.6", 409: "15.5.10", 415: "15.5.16", 416: "15.5.17",
+	422: "15.5.21", 429: "15.5.29",
+	500: "15.6.1", 501: "15.6.2", 502: "15.6.3", 503: "15.6.4", 504: "15.6.5",
+}
+
 func problem(w http.ResponseWriter, status int, title string) {
+	section, ok := rfc9110Sections[status]
+	if !ok {
+		// Fall back to the class rather than inventing a section number.
+		section = "15.5"
+		if status >= 500 {
+			section = "15.6"
+		}
+	}
 	writeJSON(w, status, map[string]any{
-		"type":   fmt.Sprintf("https://tools.ietf.org/html/rfc9110#section-15.5.%d", status-399),
+		"type":   "https://tools.ietf.org/html/rfc9110#section-" + section,
 		"title":  title,
 		"status": status,
 	})
@@ -1426,6 +1446,20 @@ func authFrom(r *http.Request) *authCtx {
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
+
+	// --- favicon.ico ------------------------------------------------------
+	// Serves a minimal 16x16 PNG favicon when requested.
+	// This prevents the 501 Not Implemented error that clients otherwise get.
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		f, err := os.Open("static/favicon.ico")
+		if err != nil {
+			http.Error(w, "favicon not found", 404)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "image/x-icon")
+		_, _ = io.Copy(w, f)
+	})
 
 	// --- unauthenticated probes -------------------------------------------
 	// Clients hit these to validate a URL before showing a login form, so they
@@ -2613,10 +2647,15 @@ func main() {
 	}
 
 	store := NewStore()
-	for _, cu := range cfg.Users {
+	// Pre-compute password hashes and write them back to config so that
+	// subsequent restarts use the same salt instead of regenerating.
+	for i := range cfg.Users {
+		cu := &cfg.Users[i]
 		hash := cu.PasswordHash
 		if hash == "" && cu.Password != "" {
 			hash = hashPassword(cu.Password)
+			// Write the computed hash back to config so next startup uses it.
+			cu.PasswordHash = hash
 		}
 		// User IDs are derived from the name so that a config-declared user
 		// keeps the same ID across restarts and across machines.
@@ -2626,6 +2665,12 @@ func main() {
 			PasswordHash: hash,
 			Admin:        cu.Admin,
 		})
+	}
+
+	// Save updated config with password hashes so subsequent restarts use same salt.
+	if path := defaultConfigPath(); path != "" {
+		b, _ := json.MarshalIndent(cfg, "", "  ")
+		_ = os.WriteFile(path, b, 0o644)
 	}
 
 	srv := &Server{

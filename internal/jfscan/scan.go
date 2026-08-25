@@ -518,12 +518,35 @@ func walk(opts Options, res *Result, fn func(dir string, depth int, entries []fs
 			continue
 		}
 		for _, e := range entries {
-			if !e.IsDir() || jfnaming.IsIgnoredDir(e.Name()) {
+			if jfnaming.IsIgnoredDir(e.Name()) {
 				continue
 			}
-			stack = append(stack, frame{filepath.Join(cur.path, e.Name()), cur.depth + 1})
+			full := filepath.Join(cur.path, e.Name())
+			if !isDir(e, full) {
+				continue
+			}
+			stack = append(stack, frame{full, cur.depth + 1})
 		}
 	}
+}
+
+// isDir reports whether an entry is a directory, following symlinks.
+//
+// os.ReadDir does not follow them -- it reports a link as a link -- so testing
+// DirEntry.IsDir alone drops the whole subtree behind a symlinked film folder,
+// and the link itself has no extension to be picked up as a video file either.
+// Libraries assembled out of links to another volume are common enough that
+// losing them silently is not acceptable. Following them is safe here because
+// the seen-set above is keyed on the resolved path.
+func isDir(e fs.DirEntry, full string) bool {
+	if e.IsDir() {
+		return true
+	}
+	if e.Type()&fs.ModeSymlink == 0 {
+		return false
+	}
+	fi, err := os.Stat(full)
+	return err == nil && fi.IsDir()
 }
 
 // ------------------------------------------------------------------- artwork
