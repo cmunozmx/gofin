@@ -222,3 +222,62 @@ func TestRevokingAUserCascadesToTokens(t *testing.T) {
 		t.Error("token survived deletion of its user; ON DELETE CASCADE is not working")
 	}
 }
+
+func TestLookupResolvesTokenAndUser(t *testing.T) {
+	s := openTest(t)
+	user := seedUser(t, s, "alice")
+
+	issued, err := s.IssueToken(user, "Delfin", "iPhone", "dev-1", "2.3.0")
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+
+	tok, u, err := s.Lookup(issued.Value)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if tok == nil || u == nil {
+		t.Fatalf("Lookup returned (%v, %v), want both", tok, u)
+	}
+	if tok.Value != issued.Value || tok.Client != "Delfin" {
+		t.Errorf("token = %+v, want the issued one", tok)
+	}
+	if u.ID != user || u.Name != "alice" {
+		t.Errorf("user = %+v, want alice", u)
+	}
+}
+
+func TestLookupUnknownTokenIsNotAnError(t *testing.T) {
+	s := openTest(t)
+
+	for _, v := range []string{"nosuchtoken", ""} {
+		tok, u, err := s.Lookup(v)
+		if err != nil {
+			t.Errorf("Lookup(%q): %v", v, err)
+		}
+		if tok != nil || u != nil {
+			t.Errorf("Lookup(%q) = (%v, %v), want both nil", v, tok, u)
+		}
+	}
+}
+
+func TestLookupAfterRevoke(t *testing.T) {
+	s := openTest(t)
+	user := seedUser(t, s, "alice")
+
+	tok, err := s.IssueToken(user, "c", "d", "did", "1.0")
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	if err := s.RevokeToken(tok.Value); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+
+	gotTok, gotUser, err := s.Lookup(tok.Value)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if gotTok != nil || gotUser != nil {
+		t.Error("a revoked token still authenticates")
+	}
+}

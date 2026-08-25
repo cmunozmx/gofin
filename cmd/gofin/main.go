@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"gofin/internal/jfauth"
+	"gofin/internal/jfdb"
 	"gofin/internal/jfid"
 	"gofin/internal/jfprobe"
 	"gofin/internal/jfscan"
@@ -517,96 +518,74 @@ func pbkdf2SHA512(password, salt []byte, iter, keyLen int) []byte {
 	return out[:keyLen]
 }
 
-// ---------------------------------------------------------------- state
+// seedUsers reconciles the users declared in the config file into the database.
+//
+// Config declares, the database caches: gofin.json is the source of truth for
+// who exists, and this runs on every boot. There is deliberately no user CRUD
+// over HTTP, so a user is created, renamed or promoted by editing the config.
+//
+// The password rule is the subtle part, and it is what lets this replace the
+// old trick of rewriting gofin.json with the computed hash:
+//
+//   - An explicit password_hash in the config always wins.
+//   - Otherwise, if the stored hash already verifies against the configured
+//     plaintext, keep the stored hash. Without this branch a config carrying
+//     only a plaintext password would re-hash with a fresh salt on every boot,
+//     churning the row and invalidating nothing but wasting the work.
+//   - Otherwise hash the plaintext: either this is first boot, or the password
+//     in the config changed.
+func seedUsers(store *Store, users []ConfigUser) error {
+	for i := range users {
+		cu := &users[i]
 
-type User struct {
-	ID           jfid.GUID
-	Name         string
-	PasswordHash string
-	Admin        bool
-	LastLogin    time.Time
-}
+		// IDs are derived from the name so a config-declared user keeps the
+		// same ID across restarts and across machines. Renaming a user
+		// therefore creates a new one, which is documented in the example
+		// config.
+		id := jfid.HashString("user:"+strings.ToLower(cu.Name), jfid.UTF16LE)
 
-type Token struct {
-	Value    string
-	UserID   jfid.GUID
-	Client   string
-	Device   string
-	DeviceID string
-	Created  time.Time
-}
+		existing, err := store.UserByID(id)
+		if err != nil {
+			return fmt.Errorf("user %q: %w", cu.Name, err)
+		}
 
-// Store is the phase-0 stand-in for the SQLite repositories. Replacing this
-// with the real thing should not require touching any handler.
-type Store struct {
-	mu     sync.RWMutex
-	users  map[jfid.GUID]*User
-	tokens map[string]*Token
-}
+		hash := cu.PasswordHash
+		switch {
+		case hash != "":
+			// explicit, use as-is
+		case existing != nil && verifyPassword(cu.Password, existing.PasswordHash):
+			hash = existing.PasswordHash
+		default:
+			hash = hashPassword(cu.Password)
+		}
 
-func NewStore() *Store {
-	return &Store{users: map[jfid.GUID]*User{}, tokens: map[string]*Token{}}
-}
-
-func (s *Store) AddUser(u *User) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.users[u.ID] = u
-}
-
-func (s *Store) UserByName(name string) *User {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, u := range s.users {
-		if strings.EqualFold(u.Name, name) {
-			return u
+		if err := store.UpsertUser(&User{
+			ID:           id,
+			Name:         cu.Name,
+			PasswordHash: hash,
+			Admin:        cu.Admin,
+		}); err != nil {
+			return fmt.Errorf("user %q: %w", cu.Name, err)
 		}
 	}
 	return nil
 }
 
-func (s *Store) UserByID(id jfid.GUID) *User {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.users[id]
-}
+// ---------------------------------------------------------------- state
 
-func (s *Store) Users() []*User {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*User, 0, len(s.users))
-	for _, u := range s.users {
-		out = append(out, u)
-	}
-	return out
-}
+// User and Token live in package jfdb, which owns their storage. Aliased here
+// so handlers, DTO builders and tests keep referring to them unqualified.
+type (
+	User  = jfdb.User
+	Token = jfdb.Token
+)
 
-func (s *Store) IssueToken(u *User, info jfauth.Info) *Token {
-	raw := make([]byte, 16)
-	_, _ = rand.Read(raw)
-	t := &Token{
-		Value:    hex.EncodeToString(raw),
-		UserID:   u.ID,
-		Client:   info.Client,
-		Device:   info.Device,
-		DeviceID: info.DeviceID,
-		Created:  time.Now(),
-	}
-	s.mu.Lock()
-	s.tokens[t.Value] = t
-	s.mu.Unlock()
-	return t
-}
-
-func (s *Store) Lookup(token string) (*Token, *User) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t := s.tokens[token]
-	if t == nil {
-		return nil, nil
-	}
-	return t, s.users[t.UserID]
-}
+// Store is the SQLite-backed repository. It replaced an in-memory map whose
+// comment promised that swapping it in "should not require touching any
+// handler"; that turned out to be true of the item store but not of this one,
+// because every lookup can now fail and a silently swallowed database error on
+// the auth path is the worst possible way to find that out.
+type Store = jfdb.Store
 
 // ---------------------------------------------------------------- items
 
@@ -1356,8 +1335,11 @@ func toUserDto(u *User, serverID string) UserDto {
 // ---------------------------------------------------------------- server
 
 type Server struct {
-	cfg      *Config
-	log      *slog.Logger
+	cfg *Config
+	log *slog.Logger
+	// db is held only so the process can close it on shutdown; every read and
+	// write goes through store.
+	db       *jfdb.DB
 	store    *Store
 	items    *ItemStore
 	tmdb     *jftmdb.Client // nil when the provider is disabled
@@ -1422,7 +1404,15 @@ func (s *Server) authenticate(next http.HandlerFunc, requireAdmin bool) http.Han
 			problem(w, http.StatusUnauthorized, "Unauthorized")
 			return
 		}
-		tok, user := s.store.Lookup(info.Token)
+		tok, user, err := s.store.Lookup(info.Token)
+		if err != nil {
+			// A database failure is not an authentication failure. Answering
+			// 401 would send every client into a re-login loop against a
+			// server that is merely broken.
+			s.log.Error("token lookup", "err", err)
+			problem(w, http.StatusInternalServerError, "Internal error")
+			return
+		}
 		if tok == nil || user == nil {
 			problem(w, http.StatusUnauthorized, "Invalid token")
 			return
@@ -1495,8 +1485,14 @@ func (s *Server) routes() http.Handler {
 	// Public user list, used to render the login screen's avatar picker. Real
 	// Jellyfin gates this on the "enable public user list" setting.
 	mux.HandleFunc("GET /Users/Public", func(w http.ResponseWriter, r *http.Request) {
+		users, err := s.store.Users()
+		if err != nil {
+			s.log.Error("public user list", "err", err)
+			problem(w, http.StatusInternalServerError, "Internal error")
+			return
+		}
 		out := []UserDto{}
-		for _, u := range s.store.Users() {
+		for _, u := range users {
 			out = append(out, toUserDto(u, s.serverID.String()))
 		}
 		writeJSON(w, 200, out)
@@ -1707,7 +1703,11 @@ func (s *Server) requestedUser(r *http.Request) (*User, bool) {
 	if !caller.Admin {
 		return nil, false
 	}
-	u := s.store.UserByID(id)
+	u, err := s.store.UserByID(id)
+	if err != nil {
+		s.log.Error("user by id", "err", err)
+		return nil, false
+	}
 	return u, u != nil
 }
 
@@ -2319,6 +2319,17 @@ func (s *Server) publicInfo(r *http.Request) PublicSystemInfo {
 	if local == "" {
 		local = fmt.Sprintf("http://%s", r.Host)
 	}
+
+	// On a database error, claim the wizard is done. The alternative sends the
+	// client into first-run setup and invites it to create an admin account
+	// against a server that cannot currently read the ones it has.
+	wizardDone := true
+	if users, err := s.store.Users(); err != nil {
+		s.log.Error("counting users for public info", "err", err)
+	} else {
+		wizardDone = len(users) > 0
+	}
+
 	return PublicSystemInfo{
 		LocalAddress:           local,
 		ServerName:             s.cfg.Server.Name,
@@ -2326,7 +2337,7 @@ func (s *Server) publicInfo(r *http.Request) PublicSystemInfo {
 		ProductName:            ProductName,
 		OperatingSystem:        "", // upstream reports "" on modern versions
 		ID:                     s.serverID,
-		StartupWizardCompleted: len(s.store.Users()) > 0,
+		StartupWizardCompleted: wizardDone,
 	}
 }
 
@@ -2342,7 +2353,12 @@ func (s *Server) handleAuthenticateByName(w http.ResponseWriter, r *http.Request
 	}
 
 	info := jfauth.FromRequest(r)
-	user := s.store.UserByName(body.Username)
+	user, err := s.store.UserByName(body.Username)
+	if err != nil {
+		s.log.Error("user by name", "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
 
 	// Constant work regardless of whether the user exists, so that response
 	// timing does not enumerate accounts.
@@ -2358,8 +2374,21 @@ func (s *Server) handleAuthenticateByName(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	user.LastLogin = time.Now().UTC()
-	tok := s.store.IssueToken(user, info)
+	// Recorded in the database rather than by mutating the shared *User, which
+	// raced every concurrent reader and was lost on restart besides. A failure
+	// here is not worth refusing a valid login over.
+	now := time.Now().UTC()
+	if err := s.store.TouchLogin(user.ID, now); err != nil {
+		s.log.Error("recording login", "user", user.Name, "err", err)
+	}
+	user.LastLogin = now
+
+	tok, err := s.store.IssueToken(user.ID, info.Client, info.Device, info.DeviceID, info.Version)
+	if err != nil {
+		s.log.Error("issuing token", "user", user.Name, "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
 	s.log.Info("login", "user", user.Name, "client", info.Client, "device", info.Device)
 
 	writeJSON(w, 200, AuthenticationResult{
@@ -2401,7 +2430,12 @@ type wsEnvelope struct {
 
 func (s *Server) handleSocket(w http.ResponseWriter, r *http.Request) {
 	info := jfauth.FromRequest(r)
-	_, user := s.store.Lookup(info.Token)
+	_, user, err := s.store.Lookup(info.Token)
+	if err != nil {
+		s.log.Error("websocket token lookup", "err", err)
+		problem(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
 	if user == nil {
 		problem(w, http.StatusUnauthorized, "Unauthorized")
 		return
@@ -2646,34 +2680,47 @@ func main() {
 		}
 	}
 
-	store := NewStore()
-	// Pre-compute password hashes and write them back to config so that
-	// subsequent restarts use the same salt instead of regenerating.
-	for i := range cfg.Users {
-		cu := &cfg.Users[i]
-		hash := cu.PasswordHash
-		if hash == "" && cu.Password != "" {
-			hash = hashPassword(cu.Password)
-			// Write the computed hash back to config so next startup uses it.
-			cu.PasswordHash = hash
-		}
-		// User IDs are derived from the name so that a config-declared user
-		// keeps the same ID across restarts and across machines.
-		store.AddUser(&User{
-			ID:           jfid.HashString("user:"+strings.ToLower(cu.Name), jfid.UTF16LE),
-			Name:         cu.Name,
-			PasswordHash: hash,
-			Admin:        cu.Admin,
-		})
+	// Media paths are checked before anything else opens: an unreadable library
+	// is almost always a mount that is not up yet or a permission problem, and
+	// both are far cheaper to see now than as an empty library after a scan.
+	if err := validateLibraryPaths(cfg.Libraries); err != nil {
+		log.Error("library configuration", "err", err)
+		os.Exit(1)
+	}
+	for _, l := range cfg.Libraries {
+		log.Info("library", "name", l.Name, "type", l.Type,
+			"path", l.Path, "readonly", l.IsReadOnly())
+	}
+	if len(cfg.Libraries) == 0 {
+		log.Warn("no libraries configured; add a \"libraries\" section to the config " +
+			"or pass -library")
 	}
 
-	// Save updated config with password hashes so subsequent restarts use same salt.
-	if path := defaultConfigPath(); path != "" {
+	// Before the database, so --dry-run stays a pure read: printing the
+	// resolved config must not create data/gofin.db as a side effect.
+	if *dryRun {
 		b, _ := json.MarshalIndent(cfg, "", "  ")
-		_ = os.WriteFile(path, b, 0o644)
+		fmt.Println(string(b))
+		return
+	}
+
+	dbPath := filepath.Join(cfg.Paths.Data, "gofin.db")
+	db, err := jfdb.Open(dbPath)
+	if err != nil {
+		log.Error("cannot open database", "path", dbPath, "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	log.Info("database", "path", dbPath)
+
+	store := jfdb.NewStore(db)
+	if err := seedUsers(store, cfg.Users); err != nil {
+		log.Error("seeding users", "err", err)
+		os.Exit(1)
 	}
 
 	srv := &Server{
+		db:       db,
 		cfg:      cfg,
 		log:      log,
 		store:    store,
@@ -2704,28 +2751,6 @@ func main() {
 		}
 	}
 
-	// Media paths are checked before the listener opens: an unreadable library
-	// is almost always a mount that is not up yet or a permission problem, and
-	// both are far cheaper to see now than as an empty library after a scan.
-	if err := validateLibraryPaths(cfg.Libraries); err != nil {
-		log.Error("library configuration", "err", err)
-		os.Exit(1)
-	}
-	for _, l := range cfg.Libraries {
-		log.Info("library", "name", l.Name, "type", l.Type,
-			"path", l.Path, "readonly", l.IsReadOnly())
-	}
-	if len(cfg.Libraries) == 0 {
-		log.Warn("no libraries configured; add a \"libraries\" section to the config " +
-			"or pass -library")
-	}
-
-	if *dryRun {
-		b, _ := json.MarshalIndent(cfg, "", "  ")
-		fmt.Println(string(b))
-		return
-	}
-
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Bind, cfg.Server.Port)
 	httpSrv := &http.Server{
 		Addr:              addr,
@@ -2739,8 +2764,14 @@ func main() {
 	// server that hangs on startup.
 	go srv.scanLibraries()
 
+	seeded, err := store.Users()
+	if err != nil {
+		log.Error("listing users", "err", err)
+		os.Exit(1)
+	}
+
 	go func() {
-		log.Info("listening", "addr", addr, "users", len(store.Users()), "version", Version)
+		log.Info("listening", "addr", addr, "users", len(seeded), "version", Version)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server failed", "err", err)
 			os.Exit(1)

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"gofin/internal/jfauth"
+	"gofin/internal/jfdb"
 	"gofin/internal/jfid"
 	"gofin/internal/jfscan"
 	"gofin/internal/jftmdb"
@@ -43,12 +44,27 @@ type testEnv struct {
 	viewer  *User
 }
 
+// newTestDB opens an empty database in a temp directory, closed when the test
+// ends. A file rather than :memory: so the tests exercise the real WAL and
+// locking behaviour.
+func newTestDB(t *testing.T) *jfdb.DB {
+	t.Helper()
+	db, err := jfdb.Open(filepath.Join(t.TempDir(), "gofin.db"))
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	cfg := defaultConfig()
 	cfg.Server.Name = "Test Server"
 
-	store := NewStore()
+	db := newTestDB(t)
+	store := jfdb.NewStore(db)
+
 	admin := &User{
 		ID:           jfid.HashString("user:admin", jfid.UTF16LE),
 		Name:         "admin",
@@ -60,12 +76,16 @@ func newTestEnv(t *testing.T) *testEnv {
 		Name:         "viewer",
 		PasswordHash: hashViewer,
 	}
-	store.AddUser(admin)
-	store.AddUser(viewer)
+	for _, u := range []*User{admin, viewer} {
+		if err := store.UpsertUser(u); err != nil {
+			t.Fatalf("seed %q: %v", u.Name, err)
+		}
+	}
 
 	srv := &Server{
 		cfg:      cfg,
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		db:       db,
 		store:    store,
 		items:    NewItemStore(),
 		serverID: jfid.HashString("gofin-server:Test Server", jfid.UTF16LE),
@@ -94,7 +114,12 @@ func (e *testEnv) do(t *testing.T, method, path, token string, body io.Reader) *
 }
 
 func (e *testEnv) tokenFor(u *User) string {
-	return e.srv.store.IssueToken(u, jfauthInfoForTest()).Value
+	info := jfauthInfoForTest()
+	tok, err := e.srv.store.IssueToken(u.ID, info.Client, info.Device, info.DeviceID, info.Version)
+	if err != nil {
+		panic("issue test token: " + err.Error())
+	}
+	return tok.Value
 }
 
 func jfauthInfoForTest() jfauth.Info {
@@ -471,35 +496,52 @@ func TestDefaultConfigPath(t *testing.T) {
 
 // -------------------------------------------------------------------- store
 
+// The repository itself is covered in depth by internal/jfdb. These two check
+// the wiring: that the Server's store is the SQLite one, seeded, and reachable.
+
 func TestStoreUserLookup(t *testing.T) {
 	e := newTestEnv(t)
 	s := e.srv.store
 
 	// Jellyfin logins are case-insensitive on the username.
 	for _, name := range []string{"admin", "ADMIN", "Admin"} {
-		if u := s.UserByName(name); u == nil || u.ID != e.admin.ID {
+		u, err := s.UserByName(name)
+		if err != nil {
+			t.Fatalf("UserByName(%q): %v", name, err)
+		}
+		if u == nil || u.ID != e.admin.ID {
 			t.Errorf("UserByName(%q) did not find the admin", name)
 		}
 	}
-	if s.UserByName("nobody") != nil {
-		t.Error("UserByName found a user that does not exist")
+
+	if u, err := s.UserByName("nobody"); err != nil || u != nil {
+		t.Errorf("UserByName(nobody) = (%v, %v), want (nil, nil)", u, err)
 	}
-	if u := s.UserByID(e.viewer.ID); u == nil || u.Name != "viewer" {
-		t.Error("UserByID did not find the viewer")
+	if u, err := s.UserByID(e.viewer.ID); err != nil || u == nil || u.Name != "viewer" {
+		t.Errorf("UserByID did not find the viewer: (%v, %v)", u, err)
 	}
-	if s.UserByID(jfid.Nil) != nil {
-		t.Error("UserByID found a user for the nil GUID")
+	if u, err := s.UserByID(jfid.Nil); err != nil || u != nil {
+		t.Errorf("UserByID(nil GUID) = (%v, %v), want (nil, nil)", u, err)
 	}
-	if got := len(s.Users()); got != 2 {
-		t.Errorf("Users() returned %d, want 2", got)
+
+	all, err := s.Users()
+	if err != nil {
+		t.Fatalf("Users: %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("Users() returned %d, want 2", len(all))
 	}
 }
 
 func TestStoreTokens(t *testing.T) {
 	e := newTestEnv(t)
 	s := e.srv.store
+	info := jfauthInfoForTest()
 
-	tok := s.IssueToken(e.admin, jfauthInfoForTest())
+	tok, err := s.IssueToken(e.admin.ID, info.Client, info.Device, info.DeviceID, info.Version)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
 	if len(tok.Value) != 32 {
 		t.Errorf("token %q is %d chars, want 32 hex chars", tok.Value, len(tok.Value))
 	}
@@ -507,7 +549,10 @@ func TestStoreTokens(t *testing.T) {
 		t.Errorf("token is not hex: %v", err)
 	}
 
-	gotTok, gotUser := s.Lookup(tok.Value)
+	gotTok, gotUser, err := s.Lookup(tok.Value)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
 	if gotTok == nil || gotUser == nil {
 		t.Fatal("Lookup did not find the freshly issued token")
 	}
@@ -518,15 +563,18 @@ func TestStoreTokens(t *testing.T) {
 		t.Errorf("token did not record the client metadata: %+v", gotTok)
 	}
 
-	if _, u := s.Lookup("0000000000000000"); u != nil {
-		t.Error("Lookup accepted an unknown token")
-	}
-	if _, u := s.Lookup(""); u != nil {
-		t.Error("Lookup accepted an empty token")
+	for _, bad := range []string{"0000000000000000", ""} {
+		if _, u, err := s.Lookup(bad); err != nil || u != nil {
+			t.Errorf("Lookup(%q) = (%v, %v), want (nil, nil)", bad, u, err)
+		}
 	}
 
 	// Two tokens for the same user must be distinct.
-	if other := s.IssueToken(e.admin, jfauthInfoForTest()); other.Value == tok.Value {
+	other, err := s.IssueToken(e.admin.ID, info.Client, info.Device, info.DeviceID, info.Version)
+	if err != nil {
+		t.Fatalf("second IssueToken: %v", err)
+	}
+	if other.Value == tok.Value {
 		t.Error("IssueToken reused a token value")
 	}
 }
@@ -589,7 +637,9 @@ func TestPublicSystemInfo(t *testing.T) {
 
 func TestPublicSystemInfoBeforeAnyUserExists(t *testing.T) {
 	e := newTestEnv(t)
-	e.srv.store = NewStore()
+	// Swap in an empty database: these endpoints must behave sanely on a server
+	// that has no users at all.
+	e.srv.store = jfdb.NewStore(newTestDB(t))
 	e.handler = e.srv.routes()
 
 	w := e.do(t, "GET", "/System/Info/Public", "", nil)
@@ -948,7 +998,9 @@ func TestUsersPublicIsAnArray(t *testing.T) {
 	}
 
 	// Even with no users the field must be [] rather than null.
-	e.srv.store = NewStore()
+	// Swap in an empty database: these endpoints must behave sanely on a server
+	// that has no users at all.
+	e.srv.store = jfdb.NewStore(newTestDB(t))
 	e.handler = e.srv.routes()
 	w = e.do(t, "GET", "/Users/Public", "", nil)
 	if strings.TrimSpace(w.Body.String()) != "[]" {

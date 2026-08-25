@@ -140,3 +140,40 @@ func (s *Store) TokensForUser(userID jfid.GUID) ([]*Token, error) {
 	}
 	return out, nil
 }
+
+// Lookup resolves a token to both the token and its user in one query.
+//
+// This is the authentication hot path -- it runs on every request that carries
+// a token -- so it is a join rather than two round trips. An unknown or revoked
+// token returns (nil, nil, nil): not an error, just not authenticated.
+func (s *Store) Lookup(value string) (*Token, *User, error) {
+	var (
+		t                 Token
+		u                 User
+		created, activity sql.NullString
+		lastLogin         sql.NullString
+	)
+	err := s.db.QueryRow(
+		`SELECT d.access_token, d.user_id, d.client, d.device, d.device_id,
+		        d.app_version, d.created, d.last_activity,
+		        u.id, u.name, u.password_hash, u.admin, u.last_login
+		 FROM devices d
+		 JOIN users u ON u.id = d.user_id
+		 WHERE d.access_token = ?`, value,
+	).Scan(
+		&t.Value, &t.UserID, &t.Client, &t.Device, &t.DeviceID,
+		&t.AppVersion, &created, &activity,
+		&u.ID, &u.Name, &u.PasswordHash, &u.Admin, &lastLogin,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("lookup token: %w", err)
+	}
+
+	t.Created = timeFromDB(created)
+	t.LastActivity = timeFromDB(activity)
+	u.LastLogin = timeFromDB(lastLogin)
+	return &t, &u, nil
+}
