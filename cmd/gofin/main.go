@@ -1587,10 +1587,25 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /Users/{userId}/Items/Latest", s.authenticate(s.handleLatestItems, false))
 	mux.HandleFunc("GET /Items/Latest", s.authenticate(s.handleLatestItems, false))
 
-	// Resume needs playback state, which nothing records yet: an empty list is
-	// the truthful answer, and it keeps "Continue Watching" from erroring.
 	mux.HandleFunc("GET /Users/{userId}/Items/Resume", s.authenticate(s.handleResumeItems, false))
 	mux.HandleFunc("GET /Items/Resume", s.authenticate(s.handleResumeItems, false))
+
+	// TV rows. There is no TV support yet, so these are genuinely empty -- but
+	// they must answer with an empty QueryResult rather than fall through to
+	// the 501 catch-all.
+	//
+	// The catch-all replies with an RFC 9457 problem document, and a client
+	// that expects a typed body decodes it regardless of status: Delfin panics
+	// with `unknown field "status", expected one of "Items", "StartIndex",
+	// "TotalRecordCount"`. A 501 is correct HTTP and useless to that client.
+	// An endpoint a client parses into a struct must return that struct's
+	// shape, or no body at all.
+	for _, p := range []string{
+		"GET /Shows/NextUp", "GET /Users/{userId}/Shows/NextUp",
+		"GET /Shows/Upcoming", "GET /Users/{userId}/Shows/Upcoming",
+	} {
+		mux.HandleFunc(p, s.authenticate(emptyQueryResult, false))
+	}
 
 	mux.HandleFunc("GET /Users/{userId}/Items/Root", s.authenticate(s.handleItemsRoot, false))
 
@@ -1707,6 +1722,23 @@ func (s *Server) routes() http.Handler {
 		s.log.Debug("display preferences write discarded", "id", r.PathValue("prefsId"))
 		w.WriteHeader(http.StatusNoContent)
 	}, false))
+
+	// Features a player probes for and can live without. Each answers 404 with
+	// an EMPTY body: "this item has none" is the truth, and an empty body is
+	// the one response a client cannot mis-decode. Falling through to the 501
+	// catch-all hands them a problem document instead, which is what produced
+	// `missing field "IntroStart"` and the trickplay decode failures.
+	// (/Videos/{id}/Intros is handled inside handleStream: Go's mux rejects it
+	// as a separate pattern alongside the /Videos/{id}/{stream} wildcard.)
+	for _, p := range []string{
+		"GET /Episode/{itemId}/IntroTimestamps",
+		"GET /Users/{userId}/Items/{itemId}/Intros",
+		// The last segment is captured whole -- "{index}.jpg" is not a legal
+		// wildcard -- so this covers both the manifest and the tile images.
+		"GET /Videos/{itemId}/Trickplay/{width}/{tile}",
+	} {
+		mux.HandleFunc(p, noContent404)
+	}
 
 	// --- websocket ---------------------------------------------------------
 
@@ -1905,6 +1937,27 @@ func (s *Server) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 		out = append(out, s.toItemDto(it, ud))
 	}
 	writeJSON(w, 200, out)
+}
+
+// emptyQueryResult answers with a well-formed, empty list.
+//
+// For endpoints a client parses into a QueryResult but this build has no data
+// for. Returning the right shape with nothing in it is both true and safe; a
+// 501 problem document is neither, because clients decode the body without
+// looking at the status.
+func emptyQueryResult(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, QueryResult[BaseItemDto]{
+		Items: []BaseItemDto{}, TotalRecordCount: 0, StartIndex: 0,
+	})
+}
+
+// noContent404 answers 404 with no body at all.
+//
+// For optional per-item features -- intro markers, trickplay tiles -- that this
+// item genuinely does not have. An empty body is the only response that cannot
+// be mis-decoded into the caller's expected type.
+func noContent404(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
 }
 
 // ------------------------------------------------------- playback reporting
@@ -2507,7 +2560,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// wildcard above -- Go rejects a more specific GET route alongside a
 	// broader HEAD one -- so it is handled here. Nothing stacks parts into a
 	// single playback yet, so the honest answer is an empty list.
-	if seg == "AdditionalParts" {
+	// Intros -- pre-roll videos -- are the same shape and the same story: none,
+	// and a client asking must get an empty list rather than a problem
+	// document it will try to decode as one.
+	if seg == "AdditionalParts" || seg == "Intros" {
 		writeJSON(w, 200, QueryResult[BaseItemDto]{Items: []BaseItemDto{}, TotalRecordCount: 0})
 		return
 	}

@@ -1022,7 +1022,11 @@ func TestSessionsReturnsEmptyArray(t *testing.T) {
 // an empty body, and must say 501 so the gap is visible.
 func TestUnimplementedRoutesReturn501(t *testing.T) {
 	e := newTestEnv(t)
-	for _, path := range []string{"/Library/VirtualFolders", "/Shows/NextUp", "/nonsense"} {
+	// /Shows/NextUp used to be here. It now answers with an empty QueryResult:
+	// a client decodes the body without checking the status, so a problem
+	// document on a list endpoint crashes it. See
+	// TestListEndpointsNeverReturnProblemDocuments.
+	for _, path := range []string{"/Library/VirtualFolders", "/nonsense"} {
 		t.Run(path, func(t *testing.T) {
 			w := e.do(t, "GET", path, "", nil)
 			if w.Code != 501 {
@@ -1035,6 +1039,81 @@ func TestUnimplementedRoutesReturn501(t *testing.T) {
 			}
 			if got["title"] == "" || got["title"] == nil {
 				t.Error("ProblemDetails has no title")
+			}
+		})
+	}
+}
+
+// A real Delfin session panicked here:
+//
+//	Error getting continue watching.: error decoding response body
+//	Caused by: unknown field `status`, expected one of `Items`, `StartIndex`,
+//	`TotalRecordCount` at line 1 column 9
+//
+// The client decodes the body into its expected type without looking at the
+// status code, so answering a list endpoint with an RFC 9457 problem document
+// is a hard crash rather than a graceful degradation. A 501 is correct HTTP and
+// useless here.
+//
+// Anything a client parses into a QueryResult must return that shape even when
+// there is nothing to put in it.
+func TestListEndpointsNeverReturnProblemDocuments(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.tokenFor(e.admin)
+	user := e.admin.ID.String()
+
+	for _, path := range []string{
+		"/Shows/NextUp",
+		"/Users/" + user + "/Shows/NextUp",
+		"/Shows/Upcoming",
+		"/Users/" + user + "/Shows/Upcoming",
+		"/Items/Resume",
+		"/Users/" + user + "/Items/Resume",
+		"/Videos/" + user + "/Intros",
+		"/Videos/" + user + "/AdditionalParts",
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := e.do(t, "GET", path, token, nil)
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+
+			var got map[string]any
+			decodeJSON(t, w, &got)
+			if _, bad := got["status"]; bad {
+				t.Fatalf("body is a problem document, which crashes clients: %s", w.Body)
+			}
+			if _, ok := got["Items"]; !ok {
+				t.Errorf("body has no Items field: %s", w.Body)
+			}
+			if _, ok := got["TotalRecordCount"]; !ok {
+				t.Errorf("body has no TotalRecordCount field: %s", w.Body)
+			}
+		})
+	}
+}
+
+// Optional per-item features answer 404 with an EMPTY body. Delfin reported
+// `missing field "IntroStart"` because the 501 catch-all handed it a problem
+// document to decode; nothing can be mis-decoded from no body at all.
+func TestOptionalItemFeaturesReturnEmptyBody(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.tokenFor(e.admin)
+	id := e.admin.ID.String() // any well-formed GUID
+
+	for _, path := range []string{
+		"/Episode/" + id + "/IntroTimestamps",
+		"/Users/" + id + "/Items/" + id + "/Intros",
+		"/Videos/" + id + "/Trickplay/320/tiles.m3u8",
+		"/Videos/" + id + "/Trickplay/320/0.jpg",
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := e.do(t, "GET", path, token, nil)
+			if w.Code != 404 {
+				t.Errorf("status = %d, want 404", w.Code)
+			}
+			if body := w.Body.String(); body != "" {
+				t.Errorf("body = %q, want empty -- a client will try to decode it", body)
 			}
 		})
 	}
