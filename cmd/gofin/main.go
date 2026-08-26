@@ -756,6 +756,7 @@ func (s *Server) scanLibraries() {
 	s.items.Replace(all)
 	s.log.Info("library scan complete", "items", len(all), "took", time.Since(start))
 
+	go s.extractEmbeddedArt()
 	if s.tmdb != nil {
 		go s.fetchArtwork()
 	}
@@ -894,6 +895,143 @@ func (s *Server) fetchArtwork() {
 		}
 		s.items.Replace(items)
 	}
+}
+
+// artExtractTimeout bounds the ffmpeg subprocess per file. Pulling an
+// already-embedded picture out is a remux, not a decode of the audio, so this
+// is generous headroom rather than an expected duration.
+const artExtractTimeout = 20 * time.Second
+
+// extractEmbeddedArt pulls cover art out of a track's own tags for albums
+// that scanned with no PrimaryImage -- no local art file beside the tracks or
+// in a conventional subfolder.
+//
+// jfscan deliberately never reads tags -- see its package doc -- because a
+// full tag parser is a lot of surface for something ffmpeg already exposes:
+// FLAC's METADATA_BLOCK_PICTURE, ID3 APIC and MP4 covr atoms all show up as
+// an attached-picture video stream, so grabbing one is the same ffmpeg
+// invocation regardless of which of those tag formats it came from.
+func (s *Server) extractEmbeddedArt() {
+	if !ffmpegAvailable() {
+		return
+	}
+	if !s.artExtractRunning.CompareAndSwap(false, true) {
+		s.log.Debug("art extraction already running")
+		return
+	}
+	defer s.artExtractRunning.Store(false)
+
+	if err := os.MkdirAll(s.posterDir(), 0o755); err != nil {
+		s.log.Error("cannot create the poster cache", "path", s.posterDir(), "err", err)
+		return
+	}
+
+	var want []jfscan.Item
+	for _, it := range s.items.All() {
+		if it.Kind != jfscan.KindMusicAlbum || it.PrimaryImage != "" {
+			continue
+		}
+		if s.cachedPoster(it.ID) != "" {
+			continue
+		}
+		if _, err := os.Stat(s.missPath(it.ID)); err == nil {
+			continue // already known to have no embedded picture either
+		}
+		want = append(want, it)
+	}
+	if len(want) == 0 {
+		return
+	}
+
+	s.log.Info("extracting embedded art", "albums", len(want))
+	start := time.Now()
+	var got, missed int
+	for _, album := range want {
+		track := s.firstAudioChild(album.ID)
+		if track == "" {
+			_ = os.WriteFile(s.missPath(album.ID), nil, 0o644)
+			missed++
+			continue
+		}
+		if err := extractPicture(track, s.posterPath(album.ID)); err != nil {
+			_ = os.WriteFile(s.missPath(album.ID), nil, 0o644)
+			missed++
+			s.log.Debug("no embedded art", "album", album.Name, "err", err)
+			continue
+		}
+		got++
+	}
+	s.log.Info("embedded art extraction complete",
+		"extracted", got, "no picture", missed, "took", time.Since(start))
+
+	// Republish so the new covers appear without waiting for a rescan.
+	if got > 0 {
+		items := s.items.All()
+		for i := range items {
+			if items[i].PrimaryImage == "" {
+				if p := s.cachedPoster(items[i].ID); p != "" {
+					items[i].PrimaryImage = p
+				}
+			}
+		}
+		s.items.Replace(items)
+	}
+}
+
+// firstAudioChild returns the path of one track under an album, any one --
+// tags rarely differ enough within an album for the choice to matter, and
+// this only runs once per album, its result cached to disk after.
+func (s *Server) firstAudioChild(albumID jfid.GUID) string {
+	for _, c := range s.items.Children(albumID) {
+		if c.Kind == jfscan.KindAudio {
+			return c.Path
+		}
+	}
+	return ""
+}
+
+// extractPicture pulls the first attached-picture stream out of src and
+// writes it to dst as a JPEG.
+//
+// The source picture may already be a JPEG or may be a PNG (both are common
+// in FLAC's METADATA_BLOCK_PICTURE); re-encoding rather than stream-copying
+// normalizes to a format that always matches the .jpg extension callers pass
+// in dst, since a mismatch there is what makes content-type sniffing lie
+// about a file's actual bytes.
+func extractPicture(src, dst string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), artExtractTimeout)
+	defer cancel()
+
+	// The muxer is forced explicitly: ffmpeg otherwise infers output format
+	// from dst's extension, and dst here ends in ".tmp" rather than ".jpg".
+	tmp := dst + ".tmp"
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-y", "-i", src,
+		"-an", "-frames:v", "1", "-update", "1", "-c:v", "mjpeg", "-f", "mjpeg",
+		tmp,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("ffmpeg: %w: %s", err, lastLines(out, 3))
+	}
+	fi, err := os.Stat(tmp)
+	if err != nil || fi.Size() == 0 {
+		os.Remove(tmp)
+		return errors.New("no embedded picture")
+	}
+	return os.Rename(tmp, dst)
+}
+
+// lastLines returns the final n lines of ffmpeg's output -- the actual error,
+// as opposed to the build banner and stream dump ahead of it, which are noise
+// once ffmpeg is known to run at all.
+func lastLines(out []byte, n int) string {
+	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return string(bytes.Join(lines, []byte("\n")))
 }
 
 // ---------------------------------------------------------------- DTOs
@@ -1068,9 +1206,9 @@ type BaseItemDto struct {
 	// Populated for scanned media. ProductionYear and RunTimeTicks are
 	// pointers so an unknown value renders as null rather than as 0 -- a
 	// client shows a zero-length item as unplayable, and year 0 as a real year.
-	ProductionYear *int     `json:"ProductionYear"`
-	RunTimeTicks   *int64   `json:"RunTimeTicks"`
-	IndexNumber    *int     `json:"IndexNumber"`
+	ProductionYear *int       `json:"ProductionYear"`
+	RunTimeTicks   *int64     `json:"RunTimeTicks"`
+	IndexNumber    *int       `json:"IndexNumber"`
 	Container      string     `json:"Container,omitempty"`
 	Album          string     `json:"Album,omitempty"`
 	AlbumArtist    string     `json:"AlbumArtist,omitempty"`
@@ -1442,7 +1580,8 @@ type Server struct {
 	serverID jfid.GUID
 	started  time.Time
 
-	artworkRunning atomic.Bool
+	artworkRunning    atomic.Bool
+	artExtractRunning atomic.Bool
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
