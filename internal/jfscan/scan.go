@@ -564,10 +564,17 @@ var artworkNames = []string{
 
 var artworkExts = []string{".jpg", ".jpeg", ".png", ".webp"}
 
+// artworkDirs holds scans that keep cover art in a subfolder next to the
+// tracks rather than beside them -- a layout common enough in scene/torrent
+// releases (Album/Artwork/cover.jpg, Album/Scans/front.jpg) that it is worth
+// a second pass rather than leaving every such album without a poster.
+var artworkDirs = []string{"artwork", "scans", "art", "images", "covers"}
+
 // findPrimaryImage looks for artwork belonging to an item.
 //
 // It checks <dir>/<conventional name>.<ext> first, then the sidecar form
-// <media file>-poster.<ext> that a bare-file layout uses.
+// <media file>-poster.<ext> that a bare-file layout uses, then one level into
+// a conventional artwork subfolder.
 func findPrimaryImage(mediaPath string, isFolder bool) string {
 	dir := mediaPath
 	if !isFolder {
@@ -578,6 +585,22 @@ func findPrimaryImage(mediaPath string, isFolder bool) string {
 		for _, e := range artworkExts {
 			if p, ok := existsCaseInsensitive(dir, name+e); ok {
 				return p
+			}
+		}
+	}
+
+	if isFolder {
+		for _, sub := range artworkDirs {
+			subdir, ok := existsCaseInsensitiveDir(dir, sub)
+			if !ok {
+				continue
+			}
+			for _, name := range artworkNames {
+				for _, e := range artworkExts {
+					if p, ok := existsCaseInsensitive(subdir, name+e); ok {
+						return p
+					}
+				}
 			}
 		}
 	}
@@ -615,6 +638,29 @@ func existsCaseInsensitive(dir, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// existsCaseInsensitiveDir finds a subdirectory ignoring case, the directory
+// counterpart of existsCaseInsensitive.
+func existsCaseInsensitiveDir(dir, name string) (string, bool) {
+	if p := filepath.Join(dir, name); dirExists(p) {
+		return p, true
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.EqualFold(e.Name(), name) {
+			return filepath.Join(dir, e.Name()), true
+		}
+	}
+	return "", false
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 func fileExists(p string) bool {
