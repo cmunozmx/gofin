@@ -1577,6 +1577,9 @@ func (s *Server) routes() http.Handler {
 	// --- authentication ----------------------------------------------------
 
 	mux.HandleFunc("POST /Users/AuthenticateByName", s.handleAuthenticateByName)
+	// ASP.NET routing (real Jellyfin) is case-insensitive; Go's mux is not.
+	// Some clients send the lowercase spelling, so register it too.
+	mux.HandleFunc("POST /Users/authenticatebyname", s.handleAuthenticateByName)
 
 	// Public user list, used to render the login screen's avatar picker. Real
 	// Jellyfin gates this on the "enable public user list" setting.
@@ -1677,6 +1680,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /Items/{itemId}", s.authenticate(s.handleItemByID, false))
 	mux.HandleFunc("GET /Users/{userId}/Items/{itemId}", s.authenticate(s.handleItemByID, false))
 
+	mux.HandleFunc("GET /Playlists/{itemId}/Items", s.authenticate(s.handlePlaylistItems, false))
+
 	// --- playback ----------------------------------------------------------
 
 	mux.HandleFunc("GET /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
@@ -1753,6 +1758,32 @@ func (s *Server) routes() http.Handler {
 	// Triggering a rescan. Upstream exposes this as a scheduled task; this is
 	// the smallest thing that lets a client ask for one.
 	mux.HandleFunc("POST /Library/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		go s.scanLibraries()
+		w.WriteHeader(http.StatusNoContent)
+	}, true))
+
+	// Per-item "refresh metadata" from an item's context menu. There is no
+	// per-item scan in jfscan, so this does the same full rescan as
+	// /Library/Refresh -- but only after confirming the item is real, so a
+	// stale or bogus id still gets a 404 instead of silently kicking a scan.
+	mux.HandleFunc("POST /Items/{itemId}/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+		id, err := jfid.Parse(r.PathValue("itemId"))
+		if err != nil {
+			problem(w, http.StatusBadRequest, "Malformed item id")
+			return
+		}
+		_, isItem := s.items.Get(id)
+		isLibraryRoot := false
+		for _, l := range s.cfg.Libraries {
+			if l.ID(s.cfg.Paths.Data) == id {
+				isLibraryRoot = true
+				break
+			}
+		}
+		if !isItem && !isLibraryRoot {
+			problem(w, http.StatusNotFound, "Item not found")
+			return
+		}
 		go s.scanLibraries()
 		w.WriteHeader(http.StatusNoContent)
 	}, true))
@@ -1924,12 +1955,100 @@ func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	children := s.items.Children(parent)
-	items := make([]BaseItemDto, 0, len(children))
-	for _, c := range children {
+	// A music library is Artist/Album/Track, several levels deep. Clients
+	// browsing its Albums or Songs tab ask for the whole subtree with
+	// Recursive=true and then filter by IncludeItemTypes -- e.g. ParentId=
+	// <musicLibrary>&Recursive=true&IncludeItemTypes=MusicAlbum. Only
+	// returning direct children (as a flat movies library can get away with)
+	// leaves that query looking at artist folders, which never match, so the
+	// library renders empty.
+	var pool []jfscan.Item
+	// Case matters to url.Values.Get, and not every client spells this
+	// PascalCase -- Gelly sends "recursive".
+	if truthy(q.Get("Recursive")) || truthy(q.Get("recursive")) {
+		pool = s.items.Descendants(parent)
+	} else {
+		pool = s.items.Children(parent)
+	}
+
+	var types map[string]bool
+	if raw := q.Get("IncludeItemTypes"); raw != "" {
+		types = map[string]bool{}
+		for _, t := range strings.Split(raw, ",") {
+			types[strings.TrimSpace(t)] = true
+		}
+	}
+
+	items := make([]BaseItemDto, 0, len(pool))
+	for _, c := range pool {
+		if types != nil && !types[string(c.Kind)] {
+			continue
+		}
 		items = append(items, s.toItemDto(c, ud))
 	}
 
+	total := len(items)
+	items = page(items, q)
+
+	writeJSON(w, 200, QueryResult[BaseItemDto]{
+		Items:            items,
+		TotalRecordCount: total,
+		StartIndex:       startIndex(q),
+	})
+}
+
+// handlePlaylistItems answers a "Play All" / "Shuffle" queue request.
+//
+// gofin has no persisted playlist entities, but clients such as Finamp build
+// a play queue for an arbitrary folder -- a library root, an album -- by
+// calling this endpoint against the folder's own id rather than paginating
+// /Items. Treating any folder id as a virtual playlist of its playable
+// descendants, in path order, answers that call without inventing real
+// playlist storage.
+func (s *Server) handlePlaylistItems(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requestedUser(r)
+	if !ok {
+		problem(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	ud := s.userDataFor(user.ID)
+
+	id, err := jfid.Parse(r.PathValue("itemId"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Malformed item id")
+		return
+	}
+
+	isFolder := false
+	if it, ok := s.items.Get(id); ok {
+		isFolder = it.IsFolder
+	} else {
+		for _, l := range s.cfg.Libraries {
+			if l.ID(s.cfg.Paths.Data) == id {
+				isFolder = true
+				break
+			}
+		}
+	}
+	if !isFolder {
+		problem(w, http.StatusNotFound, "Playlist not found")
+		return
+	}
+
+	descendants := s.items.Descendants(id)
+	tracks := descendants[:0:0]
+	for _, it := range descendants {
+		if !it.IsFolder {
+			tracks = append(tracks, it)
+		}
+	}
+	sort.Slice(tracks, func(i, j int) bool { return tracks[i].Path < tracks[j].Path })
+
+	q := r.URL.Query()
+	items := make([]BaseItemDto, 0, len(tracks))
+	for _, it := range tracks {
+		items = append(items, s.toItemDto(it, ud))
+	}
 	total := len(items)
 	items = page(items, q)
 
@@ -1955,6 +2074,14 @@ func page(items []BaseItemDto, q url.Values) []BaseItemDto {
 		}
 	}
 	return items
+}
+
+// truthy parses a query flag the way Jellyfin clients send it: "true" (any
+// case). An absent or malformed value is false rather than an error -- these
+// are optional query flags, not required fields.
+func truthy(v string) bool {
+	b, _ := strconv.ParseBool(v)
+	return b
 }
 
 func startIndex(q url.Values) int {
@@ -2665,7 +2792,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if seg != "stream" && !strings.HasPrefix(seg, "stream.") {
+	// "universal" is the negotiated-transcoding endpoint (Container,
+	// AudioCodec, TranscodingContainer, MaxStreamingBitrate, ...): a client
+	// asks for whichever of several containers/codecs it can play, and a real
+	// server picks one, transcoding if the source doesn't already match. This
+	// server transcodes nothing, so it answers the same way "stream" does --
+	// the source file, byte for byte. That is only wrong if the source
+	// container isn't one the client listed as acceptable, which is rare
+	// enough for local audio libraries not to be worth negotiating for.
+	isStream := seg == "stream" || strings.HasPrefix(seg, "stream.")
+	isUniversal := seg == "universal"
+	if !isStream && !isUniversal {
 		s.log.Warn("unimplemented endpoint", "method", r.Method, "path", r.URL.Path)
 		problem(w, http.StatusNotImplemented, "Not implemented in this build")
 		return
