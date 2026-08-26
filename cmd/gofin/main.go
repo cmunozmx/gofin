@@ -1071,10 +1071,27 @@ type BaseItemDto struct {
 	ProductionYear *int     `json:"ProductionYear"`
 	RunTimeTicks   *int64   `json:"RunTimeTicks"`
 	IndexNumber    *int     `json:"IndexNumber"`
-	Container      string   `json:"Container,omitempty"`
-	Album          string   `json:"Album,omitempty"`
-	AlbumArtist    string   `json:"AlbumArtist,omitempty"`
-	Artists        []string `json:"Artists"`
+	Container      string     `json:"Container,omitempty"`
+	Album          string     `json:"Album,omitempty"`
+	AlbumArtist    string     `json:"AlbumArtist,omitempty"`
+	AlbumID        *jfid.GUID `json:"AlbumId,omitempty"`
+	Artists        []string   `json:"Artists"`
+
+	// ArtistItems and AlbumArtists are required (non-nullable, non-optional)
+	// fields in at least one client's Jellyfin model (Gelly's MusicDto), so
+	// unlike Artists/AlbumArtist above they must always be a present array,
+	// never a missing key or null -- an item that fails to deserialize is
+	// silently dropped rather than shown with blank metadata.
+	ArtistItems  []NameGUIDPair `json:"ArtistItems"`
+	AlbumArtists []NameGUIDPair `json:"AlbumArtists"`
+	HasLyrics    bool           `json:"HasLyrics"`
+}
+
+// NameGUIDPair is upstream's NameGuidPair: a name plus the item it refers to,
+// used for the *Items lists (ArtistItems, AlbumArtists, GenreItems, ...).
+type NameGUIDPair struct {
+	Name string    `json:"Name"`
+	ID   jfid.GUID `json:"Id"`
 }
 
 // mediaTypes maps a scanned kind to the MediaType clients switch on to pick a
@@ -1123,6 +1140,8 @@ func (s *Server) toItemDto(it jfscan.Item, ud userData) BaseItemDto {
 		RemoteTrailers:       []any{},
 		LockedFields:         []string{},
 		Artists:              []string{},
+		ArtistItems:          []NameGUIDPair{},
+		AlbumArtists:         []NameGUIDPair{},
 		UserData:             ud.dto(it.ID),
 	}
 	if it.Year > 0 {
@@ -1135,6 +1154,19 @@ func (s *Server) toItemDto(it jfscan.Item, ud userData) BaseItemDto {
 	}
 	if it.AlbumArtist != "" {
 		d.Artists = []string{it.AlbumArtist}
+		pair := NameGUIDPair{Name: it.AlbumArtist, ID: s.artistID(it)}
+		d.ArtistItems = []NameGUIDPair{pair}
+		d.AlbumArtists = []NameGUIDPair{pair}
+	}
+	// A track's immediate parent is its album, when it has one (some clients
+	// -- Gelly among them -- request cover art by AlbumId, not by the track's
+	// own id, and fall back to a synthetic id when this is absent, which then
+	// resolves to nothing on the server).
+	if it.Kind == jfscan.KindAudio {
+		if album, ok := s.items.Get(it.ParentID); ok && album.Kind == jfscan.KindMusicAlbum {
+			id := album.ID
+			d.AlbumID = &id
+		}
 	}
 	if it.IsFolder {
 		d.ChildCount = s.items.ChildCount(it.ID)
@@ -1146,9 +1178,40 @@ func (s *Server) toItemDto(it jfscan.Item, ud userData) BaseItemDto {
 		tag := jfid.ImageTag(it.PrimaryImage, jftime.UnixToTicks(it.Modified), jfid.UTF16LE)
 		d.ImageTags["Primary"] = tag
 	}
-	// RunTimeTicks stays nil: nothing here probes container duration, and
-	// reporting 0 would make every item look zero-length.
+	// RunTimeTicks is required (present and non-null), not just optional, in
+	// at least one client's model (Gelly's MusicDto): a null value fails that
+	// item's deserialization and the item is silently dropped, which is why a
+	// whole music library could show zero songs despite scanning fine. Actual
+	// duration comes from ffprobe, cached to disk after the first read, so
+	// this is a one-time cost per file rather than one per listing.
+	if !it.IsFolder {
+		ticks := int64(0)
+		if mi := s.mediaInfoFor(it); mi != nil && mi.Duration > 0 {
+			ticks = int64(mi.Duration / 100)
+		}
+		d.RunTimeTicks = &ticks
+	}
 	return d
+}
+
+// artistID resolves the item id of it's album artist, by walking up the
+// scanned Artist/Album/Track hierarchy jfscan built. jfscan.Item only carries
+// the artist's name (AlbumArtist), not its id, so this is the one place that
+// needs to look it back up.
+func (s *Server) artistID(it jfscan.Item) jfid.GUID {
+	parent, ok := s.items.Get(it.ParentID)
+	if !ok {
+		return jfid.GUID{}
+	}
+	if parent.Kind == jfscan.KindMusicArtist {
+		return parent.ID
+	}
+	if parent.Kind == jfscan.KindMusicAlbum {
+		if artist, ok := s.items.Get(parent.ParentID); ok && artist.Kind == jfscan.KindMusicArtist {
+			return artist.ID
+		}
+	}
+	return jfid.GUID{}
 }
 
 // userData is one user's state for every item they have touched, loaded once
