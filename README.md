@@ -57,6 +57,45 @@ cp gofin.example.json gofin.json   # annotated starting point; edit it
 `gofin.example.json` documents every key inline and is the intended way in.
 `./gofin config` prints the same defaults without the commentary.
 
+## Running as a Podman Quadlet service
+
+A `Dockerfile` is included to containerize gofin. Build and run it as a systemd-integrated service using Podman Quadlets:
+
+```sh
+# Build the container image
+podman build -t localhost/gofin:latest .
+
+# Create config and state directories
+mkdir -p ~/.config/gofin ~/.local/share/gofin/{data,cache,logs,config}
+
+# Copy configuration (edit as needed)
+cp gofin.example.json ~/.config/gofin/gofin.json
+
+# Install the Quadlet service file
+mkdir -p ~/.config/containers/systemd
+cp gofin.container.example ~/.config/containers/systemd/gofin.container
+# Edit ~/.config/containers/systemd/gofin.container to adjust paths as needed
+
+# Start the service
+systemctl --user daemon-reload
+systemctl --user start gofin
+
+# Manage the service
+systemctl --user status gofin                # Check status
+systemctl --user logs gofin -f               # Tail logs
+systemctl --user restart gofin               # Restart
+systemctl --user stop gofin                  # Stop
+```
+
+**Key features of the Quadlet setup:**
+- **Read-only media volumes** mounted from `/mnt/alberca` with `:Z` SELinux relabeling
+- **User namespace mapping** (`UserNS=keep-id`) so the container user has proper access to volumes
+- **Persistent state** in `~/.local/share/gofin/` for data, cache, logs, and config
+- **Configuration** via `~/.config/gofin/gofin.json`
+- **Port 8096** published for client access
+
+The service restarts automatically on failure and integrates with systemd's user session.
+
 ## Configuring libraries
 
 A library is one media root. Declare them in `gofin.json`:

@@ -1,0 +1,33 @@
+[Unit]
+Description=gofin media server
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/gofin:latest
+PublishPort=8096:8096
+
+# Media volumes (read-only with SELinux relabeling)
+Volume=/mnt/alberca/Movies:/mnt/alberca/Movies:ro,Z
+Volume=/mnt/alberca/Music:/mnt/alberca/Music:ro,Z
+
+# State directories (writable)
+Volume=%h/.local/share/gofin/data:/app/data:Z
+Volume=%h/.local/share/gofin/cache:/app/cache:Z
+Volume=%h/.local/share/gofin/logs:/app/logs:Z
+Volume=%h/.local/share/gofin/config:/app/config:Z
+
+# Configuration file (read-only with SELinux relabeling)
+Volume=%h/.config/gofin/gofin.json:/app/gofin.json:ro,Z
+
+# Podman settings
+User=1000:1000
+Timezone=local
+UserNS=keep-id
+
+[Service]
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
