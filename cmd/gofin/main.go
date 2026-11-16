@@ -166,7 +166,7 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 
 	if path != "" {
 		b, err := os.ReadFile(path)
-		if err != nil && !(errors.Is(err, os.ErrNotExist) && path == defaultConfigPath()) {
+		if err != nil && (!errors.Is(err, os.ErrNotExist) || path != defaultConfigPath()) {
 			return nil, fmt.Errorf("reading config %s: %w", path, err)
 		}
 		if err == nil {
@@ -195,6 +195,12 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 		if v := os.Getenv(env); v != "" {
 			*dst = v
 		}
+	}
+	// Naming the web directory is the request to serve it, as it is for
+	// -webdir. That lets the container image switch the interface on without
+	// anyone editing a config file; -no-web, a later layer, still wins.
+	if os.Getenv("JELLYFIN_WEB_DIR") != "" {
+		cfg.Web.Enabled = true
 	}
 	if v := os.Getenv("JELLYFIN_PublishedServerUrl"); v != "" {
 		cfg.Server.PublishedURL = v
@@ -437,7 +443,7 @@ func validateLibraryPaths(libs []Library) error {
 			return fmt.Errorf("library %q: cannot read %s: %w", l.Name, l.Path, err)
 		}
 		_, err = f.ReadDir(1)
-		f.Close()
+		_ = f.Close()
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("library %q: cannot list %s: %w", l.Name, l.Path, err)
 		}
@@ -1012,12 +1018,12 @@ func extractPicture(src, dst string) error {
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %w: %s", err, lastLines(out, 3))
 	}
 	fi, err := os.Stat(tmp)
 	if err != nil || fi.Size() == 0 {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return errors.New("no embedded picture")
 	}
 	return os.Rename(tmp, dst)
@@ -1066,6 +1072,16 @@ type SystemInfo struct {
 	InternalMetadataPath   string `json:"InternalMetadataPath"`
 	TranscodingTempPath    string `json:"TranscodingTempPath"`
 	SystemArchitecture     string `json:"SystemArchitecture"`
+	// Chromecast receivers, from the server configuration upstream. None are
+	// configured here; the web interface iterates the list, so it has to be
+	// present and an array.
+	CastReceiverApplications []CastReceiverApplication `json:"CastReceiverApplications"`
+}
+
+// CastReceiverApplication is MediaBrowser.Model.System.CastReceiverApplication.
+type CastReceiverApplication struct {
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
 }
 
 type UserPolicy struct {
@@ -1315,6 +1331,10 @@ func (s *Server) toItemDto(it jfscan.Item, ud userData) BaseItemDto {
 	if it.PrimaryImage != "" {
 		tag := jfid.ImageTag(it.PrimaryImage, jftime.UnixToTicks(it.Modified), jfid.UTF16LE)
 		d.ImageTags["Primary"] = tag
+		// The poster doubles as the only backdrop. Delfin's wide Home rows
+		// build their URL from Thumb or BackdropImageTags alone -- never
+		// Primary -- so without this those tiles have no image to load.
+		d.BackdropImageTags = []string{tag}
 	}
 	// RunTimeTicks is required (present and non-null), not just optional, in
 	// at least one client's model (Gelly's MusicDto): a null value fails that
@@ -1632,8 +1652,8 @@ type authCtx struct {
 	Info  jfauth.Info
 }
 
-func (s *Server) authenticate(next http.HandlerFunc, requireAdmin bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) authenticate(next http.HandlerFunc, requireAdmin bool) authedHandler {
+	return authedHandler{admin: requireAdmin, h: func(w http.ResponseWriter, r *http.Request) {
 		info := jfauth.FromRequest(r)
 		if !info.HasToken() {
 			problem(w, http.StatusUnauthorized, "Unauthorized")
@@ -1661,7 +1681,7 @@ func (s *Server) authenticate(next http.HandlerFunc, requireAdmin bool) http.Han
 		}
 		ctx := context.WithValue(r.Context(), ctxAuth, &authCtx{User: user, Token: tok, Info: info})
 		next(w, r.WithContext(ctx))
-	}
+	}}
 }
 
 func authFrom(r *http.Request) *authCtx {
@@ -1670,7 +1690,7 @@ func authFrom(r *http.Request) *authCtx {
 }
 
 func (s *Server) routes() http.Handler {
-	mux := http.NewServeMux()
+	mux := newAPIMux()
 
 	// --- favicon.ico ------------------------------------------------------
 	// Serves a minimal 16x16 PNG favicon when requested.
@@ -1681,7 +1701,7 @@ func (s *Server) routes() http.Handler {
 			http.Error(w, "favicon not found", 404)
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		w.Header().Set("Content-Type", "image/x-icon")
 		_, _ = io.Copy(w, f)
 	})
@@ -1738,39 +1758,40 @@ func (s *Server) routes() http.Handler {
 
 	// --- authenticated -----------------------------------------------------
 
-	mux.HandleFunc("GET /Users/Me", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /Users/Me", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, toUserDto(authFrom(r).User, s.serverID.String()))
 	}, false))
 
-	mux.HandleFunc("GET /System/Info", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /System/Info", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		wd, _ := os.Getwd()
 		writeJSON(w, 200, SystemInfo{
-			PublicSystemInfo:       s.publicInfo(r),
-			HasPendingRestart:      false,
-			SupportsLibraryMonitor: true,
-			WebSocketPortNumber:    s.cfg.Server.Port,
-			CanSelfRestart:         false,
-			ProgramDataPath:        abs(s.cfg.Paths.Data, wd),
-			CachePath:              abs(s.cfg.Paths.Cache, wd),
-			LogPath:                abs(s.cfg.Paths.Logs, wd),
-			InternalMetadataPath:   abs(filepath.Join(s.cfg.Paths.Data, "metadata"), wd),
-			TranscodingTempPath:    abs(filepath.Join(s.cfg.Paths.Cache, "transcodes"), wd),
-			SystemArchitecture:     "X64",
+			CastReceiverApplications: []CastReceiverApplication{},
+			PublicSystemInfo:         s.publicInfo(r),
+			HasPendingRestart:        false,
+			SupportsLibraryMonitor:   true,
+			WebSocketPortNumber:      s.cfg.Server.Port,
+			CanSelfRestart:           false,
+			ProgramDataPath:          abs(s.cfg.Paths.Data, wd),
+			CachePath:                abs(s.cfg.Paths.Cache, wd),
+			LogPath:                  abs(s.cfg.Paths.Logs, wd),
+			InternalMetadataPath:     abs(filepath.Join(s.cfg.Paths.Data, "metadata"), wd),
+			TranscodingTempPath:      abs(filepath.Join(s.cfg.Paths.Cache, "transcodes"), wd),
+			SystemArchitecture:       "X64",
 		})
 	}, true))
 
-	mux.HandleFunc("GET /System/Endpoint", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /System/Endpoint", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]bool{
 			"IsLocal":     isLocalRequest(r),
 			"IsInNetwork": isLocalRequest(r),
 		})
 	}, false))
 
-	mux.HandleFunc("GET /Sessions", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /Sessions", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []SessionInfoDto{})
 	}, false))
 
-	mux.HandleFunc("POST /Sessions/Capabilities/Full", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /Sessions/Capabilities/Full", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusNoContent)
 	}, false))
@@ -1780,22 +1801,22 @@ func (s *Server) routes() http.Handler {
 	// Both spellings of the same thing. Newer clients call /UserViews with the
 	// user in a query parameter; older ones -- Delfin among them -- use the
 	// per-user path form. Neither is deprecated enough to skip.
-	mux.HandleFunc("GET /UserViews", s.authenticate(s.handleUserViews, false))
-	mux.HandleFunc("GET /Users/{userId}/Views", s.authenticate(s.handleUserViews, false))
+	mux.Handle("GET /UserViews", s.authenticate(s.handleUserViews, false))
+	mux.Handle("GET /Users/{userId}/Views", s.authenticate(s.handleUserViews, false))
 
-	mux.HandleFunc("GET /Users/{userId}/Items", s.authenticate(s.handleUserItems, false))
-	mux.HandleFunc("GET /Items", s.authenticate(s.handleUserItems, false))
+	mux.Handle("GET /Users/{userId}/Items", s.authenticate(s.handleUserItems, false))
+	mux.Handle("GET /Items", s.authenticate(s.handleUserItems, false))
 
 	// These literal segments MUST be registered alongside the {itemId}
 	// wildcard. Without them "/Users/{id}/Items/Latest" matches the wildcard,
 	// "Latest" is parsed as a GUID, and the client's home screen gets a 400.
 	// Go's mux prefers the more specific pattern, so registration order does
 	// not matter -- but omitting them silently breaks real endpoints.
-	mux.HandleFunc("GET /Users/{userId}/Items/Latest", s.authenticate(s.handleLatestItems, false))
-	mux.HandleFunc("GET /Items/Latest", s.authenticate(s.handleLatestItems, false))
+	mux.Handle("GET /Users/{userId}/Items/Latest", s.authenticate(s.handleLatestItems, false))
+	mux.Handle("GET /Items/Latest", s.authenticate(s.handleLatestItems, false))
 
-	mux.HandleFunc("GET /Users/{userId}/Items/Resume", s.authenticate(s.handleResumeItems, false))
-	mux.HandleFunc("GET /Items/Resume", s.authenticate(s.handleResumeItems, false))
+	mux.Handle("GET /Users/{userId}/Items/Resume", s.authenticate(s.handleResumeItems, false))
+	mux.Handle("GET /Items/Resume", s.authenticate(s.handleResumeItems, false))
 
 	// TV rows. There is no TV support yet, so these are genuinely empty -- but
 	// they must answer with an empty QueryResult rather than fall through to
@@ -1811,20 +1832,20 @@ func (s *Server) routes() http.Handler {
 		"GET /Shows/NextUp", "GET /Users/{userId}/Shows/NextUp",
 		"GET /Shows/Upcoming", "GET /Users/{userId}/Shows/Upcoming",
 	} {
-		mux.HandleFunc(p, s.authenticate(emptyQueryResult, false))
+		mux.Handle(p, s.authenticate(emptyQueryResult, false))
 	}
 
-	mux.HandleFunc("GET /Users/{userId}/Items/Root", s.authenticate(s.handleItemsRoot, false))
+	mux.Handle("GET /Users/{userId}/Items/Root", s.authenticate(s.handleItemsRoot, false))
 
-	mux.HandleFunc("GET /Items/{itemId}", s.authenticate(s.handleItemByID, false))
-	mux.HandleFunc("GET /Users/{userId}/Items/{itemId}", s.authenticate(s.handleItemByID, false))
+	mux.Handle("GET /Items/{itemId}", s.authenticate(s.handleItemByID, false))
+	mux.Handle("GET /Users/{userId}/Items/{itemId}", s.authenticate(s.handleItemByID, false))
 
-	mux.HandleFunc("GET /Playlists/{itemId}/Items", s.authenticate(s.handlePlaylistItems, false))
+	mux.Handle("GET /Playlists/{itemId}/Items", s.authenticate(s.handlePlaylistItems, false))
 
 	// --- playback ----------------------------------------------------------
 
-	mux.HandleFunc("GET /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
-	mux.HandleFunc("POST /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
+	mux.Handle("GET /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
+	mux.Handle("POST /Items/{itemId}/PlaybackInfo", s.authenticate(s.handlePlaybackInfo, false))
 
 	// The stream endpoints are NOT behind s.authenticate. A media player is
 	// frequently a separate process (libmpv, ExoPlayer, an <video> element) that
@@ -1855,38 +1876,38 @@ func (s *Server) routes() http.Handler {
 	// progress may refuse to start playback, and it will retry a failing call
 	// for the whole of playback. A write failure is logged and still answered
 	// 204.
-	mux.HandleFunc("POST /Sessions/Playing", s.authenticate(s.handlePlaybackStart, false))
-	mux.HandleFunc("POST /Sessions/Playing/Progress", s.authenticate(s.handlePlaybackProgress, false))
-	mux.HandleFunc("POST /Sessions/Playing/Stopped", s.authenticate(s.handlePlaybackStopped, false))
-	mux.HandleFunc("POST /Sessions/Playing/Ping", s.authenticate(s.handlePlaybackPing, false))
+	mux.Handle("POST /Sessions/Playing", s.authenticate(s.handlePlaybackStart, false))
+	mux.Handle("POST /Sessions/Playing/Progress", s.authenticate(s.handlePlaybackProgress, false))
+	mux.Handle("POST /Sessions/Playing/Stopped", s.authenticate(s.handlePlaybackStopped, false))
+	mux.Handle("POST /Sessions/Playing/Ping", s.authenticate(s.handlePlaybackPing, false))
 
 	// Marking watched and favourited. Both spellings of each: Delfin and other
 	// established clients use the legacy per-user paths, newer ones do not.
 	for _, p := range []string{
 		"POST /Users/{userId}/FavoriteItems/{itemId}", "POST /UserFavoriteItems/{itemId}",
 	} {
-		mux.HandleFunc(p, s.authenticate(s.handleSetFavorite(true), false))
+		mux.Handle(p, s.authenticate(s.handleSetFavorite(true), false))
 	}
 	for _, p := range []string{
 		"DELETE /Users/{userId}/FavoriteItems/{itemId}", "DELETE /UserFavoriteItems/{itemId}",
 	} {
-		mux.HandleFunc(p, s.authenticate(s.handleSetFavorite(false), false))
+		mux.Handle(p, s.authenticate(s.handleSetFavorite(false), false))
 	}
 	for _, p := range []string{
 		"POST /Users/{userId}/PlayedItems/{itemId}", "POST /UserPlayedItems/{itemId}",
 	} {
-		mux.HandleFunc(p, s.authenticate(s.handleSetPlayed(true), false))
+		mux.Handle(p, s.authenticate(s.handleSetPlayed(true), false))
 	}
 	for _, p := range []string{
 		"DELETE /Users/{userId}/PlayedItems/{itemId}", "DELETE /UserPlayedItems/{itemId}",
 	} {
-		mux.HandleFunc(p, s.authenticate(s.handleSetPlayed(false), false))
+		mux.Handle(p, s.authenticate(s.handleSetPlayed(false), false))
 	}
 
 	// Logging out. Tokens outlive the process now, so there has to be a way to
 	// end one deliberately.
-	mux.HandleFunc("POST /Sessions/Logout", s.authenticate(s.handleLogout, false))
-	mux.HandleFunc("DELETE /Sessions/AccessToken", s.authenticate(s.handleRevokeToken, true))
+	mux.Handle("POST /Sessions/Logout", s.authenticate(s.handleLogout, false))
+	mux.Handle("DELETE /Sessions/AccessToken", s.authenticate(s.handleRevokeToken, true))
 
 	// Artwork. Unauthenticated on purpose: these URLs go straight into <img>
 	// tags, which cannot set an Authorization header, and upstream serves them
@@ -1896,7 +1917,7 @@ func (s *Server) routes() http.Handler {
 
 	// Triggering a rescan. Upstream exposes this as a scheduled task; this is
 	// the smallest thing that lets a client ask for one.
-	mux.HandleFunc("POST /Library/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /Library/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		go s.scanLibraries()
 		w.WriteHeader(http.StatusNoContent)
 	}, true))
@@ -1905,7 +1926,7 @@ func (s *Server) routes() http.Handler {
 	// per-item scan in jfscan, so this does the same full rescan as
 	// /Library/Refresh -- but only after confirming the item is real, so a
 	// stale or bogus id still gets a 404 instead of silently kicking a scan.
-	mux.HandleFunc("POST /Items/{itemId}/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /Items/{itemId}/Refresh", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		id, err := jfid.Parse(r.PathValue("itemId"))
 		if err != nil {
 			problem(w, http.StatusBadRequest, "Malformed item id")
@@ -1930,7 +1951,7 @@ func (s *Server) routes() http.Handler {
 	// Retry artwork without a full rescan. Clearing the miss markers first
 	// makes this also a way to re-try titles TMDB could not match, after
 	// renaming the files that caused it.
-	mux.HandleFunc("POST /Library/RefreshArtwork", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /Library/RefreshArtwork", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
 		if s.tmdb == nil {
 			problem(w, http.StatusServiceUnavailable, "No artwork provider is configured")
 			return
@@ -1948,23 +1969,10 @@ func (s *Server) routes() http.Handler {
 		problem(w, http.StatusNotFound, "No primary image")
 	})
 
-	// Display preferences are the client's own UI state. Nothing is persisted
-	// yet, so every client gets the defaults back; answering with a valid shape
-	// matters more than remembering it, because a client that fails to read its
-	// preferences can stop before rendering anything at all.
-	mux.HandleFunc("GET /DisplayPreferences/{prefsId}", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("prefsId")
-		s.log.Debug("display preferences read (not persisted)", "id", id)
-		writeJSON(w, 200, defaultDisplayPreferences(id, r.URL.Query().Get("client")))
-	}, false))
-
-	// Accepted and discarded. Returning an error here makes some clients retry
-	// the write in a loop.
-	mux.HandleFunc("POST /DisplayPreferences/{prefsId}", s.authenticate(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		s.log.Debug("display preferences write discarded", "id", r.PathValue("prefsId"))
-		w.WriteHeader(http.StatusNoContent)
-	}, false))
+	// Display preferences: stored per user, preferences id and client. See
+	// displayprefs.go.
+	mux.Handle("GET /DisplayPreferences/{prefsId}", s.authenticate(s.handleGetDisplayPrefs, false))
+	mux.Handle("POST /DisplayPreferences/{prefsId}", s.authenticate(s.handleSetDisplayPrefs, false))
 
 	// Features a player probes for and can live without. Each answers 404 with
 	// an EMPTY body: "this item has none" is the truth, and an empty body is
@@ -1975,7 +1983,6 @@ func (s *Server) routes() http.Handler {
 	// as a separate pattern alongside the /Videos/{id}/{stream} wildcard.)
 	for _, p := range []string{
 		"GET /Episode/{itemId}/IntroTimestamps",
-		"GET /Users/{userId}/Items/{itemId}/Intros",
 		// The last segment is captured whole -- "{index}.jpg" is not a legal
 		// wildcard -- so this covers both the manifest and the tile images.
 		"GET /Videos/{itemId}/Trickplay/{width}/{tile}",
@@ -1987,6 +1994,12 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("GET /socket", s.handleSocket)
 
+	// --- web interface ------------------------------------------------------
+	// The API routes only the web interface asks for (webapi.go), then "/"
+	// and the /web/ tree itself (web.go).
+	s.registerWebAPI(mux)
+	s.registerWeb(mux)
+
 	// --- everything else ---------------------------------------------------
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1994,7 +2007,13 @@ func (s *Server) routes() http.Handler {
 		problem(w, http.StatusNotImplemented, "Not implemented in this build")
 	})
 
+	// --- API description -----------------------------------------------------
+	// Last, so the generated spec sees every route above.
+	s.registerAPIDocs(mux)
+
 	var h http.Handler = mux
+	// Built last, from every route registered above. See caseroute.go.
+	h = newCaseRouter(mux.routes).wrap(h)
 	h = s.stripBaseURL(h)
 	h = s.withCORS(h)
 	h = s.withLogging(h)
@@ -2058,11 +2077,10 @@ func (s *Server) handleUserViews(w http.ResponseWriter, r *http.Request) {
 
 // handleUserItems answers the browse query.
 //
-// At the top level -- no ParentId -- the answer is the library roots, which the
-// configuration already gives us. Anything below that needs the scanner, so it
-// returns an empty result rather than an error: the client renders an empty
-// library, which is true, instead of an error dialog, which would be
-// misleading. The WARN keeps the gap visible in the log.
+// At the top level -- no ParentId and no Recursive -- the answer is the
+// library roots, which the configuration already gives us. Everything else is
+// a set of scanned items, chosen, restricted and ordered by the query; see
+// itemquery.go for what each parameter means here.
 func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requestedUser(r)
 	if !ok {
@@ -2072,13 +2090,18 @@ func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 	ud := s.userDataFor(user.ID)
 
 	q := r.URL.Query()
-	raw := q.Get("ParentId")
-	if raw == "" {
-		raw = q.Get("parentId")
+	pool, top, err := s.itemPool(q)
+	if err == nil && !top {
+		pool, err = s.filterItems(pool, q, ud)
+	}
+	if err != nil {
+		problem(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	// No parent means the top level, which is the set of libraries.
-	if raw == "" {
+	// No parent and no recursion means the top level, which is the set of
+	// libraries.
+	if top {
 		views := s.views(ud)
 		writeJSON(w, 200, QueryResult[BaseItemDto]{
 			Items:            views,
@@ -2087,42 +2110,10 @@ func (s *Server) handleUserItems(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	parent, err := jfid.Parse(raw)
-	if err != nil {
-		problem(w, http.StatusBadRequest, "Malformed ParentId")
-		return
-	}
-
-	// A music library is Artist/Album/Track, several levels deep. Clients
-	// browsing its Albums or Songs tab ask for the whole subtree with
-	// Recursive=true and then filter by IncludeItemTypes -- e.g. ParentId=
-	// <musicLibrary>&Recursive=true&IncludeItemTypes=MusicAlbum. Only
-	// returning direct children (as a flat movies library can get away with)
-	// leaves that query looking at artist folders, which never match, so the
-	// library renders empty.
-	var pool []jfscan.Item
-	// Case matters to url.Values.Get, and not every client spells this
-	// PascalCase -- Gelly sends "recursive".
-	if truthy(q.Get("Recursive")) || truthy(q.Get("recursive")) {
-		pool = s.items.Descendants(parent)
-	} else {
-		pool = s.items.Children(parent)
-	}
-
-	var types map[string]bool
-	if raw := q.Get("IncludeItemTypes"); raw != "" {
-		types = map[string]bool{}
-		for _, t := range strings.Split(raw, ",") {
-			types[strings.TrimSpace(t)] = true
-		}
-	}
+	sortItems(pool, q, ud)
 
 	items := make([]BaseItemDto, 0, len(pool))
 	for _, c := range pool {
-		if types != nil && !types[string(c.Kind)] {
-			continue
-		}
 		items = append(items, s.toItemDto(c, ud))
 	}
 
@@ -2590,8 +2581,12 @@ func (s *Server) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "Malformed item id")
 		return
 	}
-	if t := r.PathValue("imageType"); !strings.EqualFold(t, "Primary") {
-		// Backdrop, Logo, Thumb and friends all need a provider.
+	// Backdrop is served from the poster (see toItemDto), and only at index
+	// 0: there is exactly one. Logo, Thumb and friends all need a provider.
+	switch t := r.PathValue("imageType"); {
+	case strings.EqualFold(t, "Primary"):
+	case strings.EqualFold(t, "Backdrop") && (r.PathValue("index") == "" || r.PathValue("index") == "0"):
+	default:
 		problem(w, http.StatusNotFound, "No image of that type")
 		return
 	}
@@ -2607,7 +2602,7 @@ func (s *Server) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "No primary image")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
 		problem(w, http.StatusNotFound, "No primary image")
@@ -2964,7 +2959,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "Media file unavailable")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -3257,7 +3252,7 @@ func (s *Server) handleSocket(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("websocket upgrade failed", "err", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	const keepAliveSeconds = 30
 	send := func(msgType string, data any) error {
@@ -3521,7 +3516,7 @@ func main() {
 		log.Error("cannot open database", "path", dbPath, "err", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	log.Info("database", "path", dbPath)
 
 	store := jfdb.NewStore(db)
@@ -3589,9 +3584,17 @@ func main() {
 		}
 	}()
 
+	// SIGHUP rescans the libraries rather than stopping, so a service manager's
+	// "reload" (systemctl reload) picks up new media without a restart.
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	for got := range sig {
+		if got != syscall.SIGHUP {
+			break
+		}
+		log.Info("SIGHUP received; rescanning libraries")
+		go srv.scanLibraries()
+	}
 	log.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

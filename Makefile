@@ -161,7 +161,7 @@ all: check build
 
 ## tools: install the optional development tools
 tools:
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 	go install honnef.co/go/tools/cmd/staticcheck@latest
 
 # ------------------------------------------------------------------- clean

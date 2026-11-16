@@ -35,7 +35,7 @@ func TestSearchMovie(t *testing.T) {
 		gotQuery = r.URL.Query().Get("query")
 		gotYear = r.URL.Query().Get("year")
 		gotKey = r.URL.Query().Get("api_key")
-		w.Write([]byte(oneHit))
+		_, _ = w.Write([]byte(oneHit))
 	})
 
 	m, err := c.SearchMovie(context.Background(), "Arrival", 2016)
@@ -65,7 +65,7 @@ func TestSearchWithoutAPIKey(t *testing.T) {
 	var called atomic.Bool
 	c := fakeTMDB(t, func(w http.ResponseWriter, r *http.Request) {
 		called.Store(true)
-		w.Write([]byte(oneHit))
+		_, _ = w.Write([]byte(oneHit))
 	})
 	c.APIKey = ""
 
@@ -85,11 +85,11 @@ func TestSearchRetriesWithoutYear(t *testing.T) {
 	c := fakeTMDB(t, func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&calls, 1)
 		if r.URL.Query().Get("year") != "" {
-			w.Write([]byte(`{"results":[]}`)) // nothing for that year
+			_, _ = w.Write([]byte(`{"results":[]}`)) // nothing for that year
 			return
 		}
 		_ = n
-		w.Write([]byte(oneHit))
+		_, _ = w.Write([]byte(oneHit))
 	})
 
 	m, err := c.SearchMovie(context.Background(), "Arrival", 1999)
@@ -106,7 +106,7 @@ func TestSearchRetriesWithoutYear(t *testing.T) {
 
 func TestSearchNotFound(t *testing.T) {
 	c := fakeTMDB(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 	if _, err := c.SearchMovie(context.Background(), "No Such Film", 0); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -116,7 +116,7 @@ func TestSearchNotFound(t *testing.T) {
 // A hit with no poster is still a miss as far as artwork is concerned.
 func TestSearchHitWithoutPoster(t *testing.T) {
 	c := fakeTMDB(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"results":[{"id":1,"title":"X","release_date":"2000-01-01","poster_path":""}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"id":1,"title":"X","release_date":"2000-01-01","poster_path":""}]}`))
 	})
 	if _, err := c.SearchMovie(context.Background(), "X", 0); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -185,7 +185,7 @@ func TestDownloadPoster(t *testing.T) {
 		if !strings.Contains(r.URL.Path, "/img/w500/x.jpg") {
 			t.Errorf("unexpected image path %q", r.URL.Path)
 		}
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 
 	dest := filepath.Join(t.TempDir(), "nested", "poster.jpg")
@@ -248,7 +248,7 @@ func TestContextCancellation(t *testing.T) {
 // key rate-limited, so calls are spaced out.
 func TestThrottle(t *testing.T) {
 	c := fakeTMDB(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(oneHit))
+		_, _ = w.Write([]byte(oneHit))
 	})
 	c.MinInterval = 40 * time.Millisecond
 

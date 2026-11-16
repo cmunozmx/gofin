@@ -85,8 +85,8 @@ func dialWith(t *testing.T, key string, extra map[string]string) *wsPair {
 	t.Cleanup(func() {
 		// Close both ends before the server: httptest.Server.Close blocks on
 		// connections it thinks are still in flight.
-		sc.Close()
-		client.Close()
+		_ = sc.Close()
+		_ = client.Close()
 		srv.Close()
 	})
 	return p
@@ -208,9 +208,9 @@ func TestHandshakeAcceptKey(t *testing.T) {
 			}
 			t.Cleanup(func() {
 				if sc := <-conns; sc != nil {
-					sc.Close()
+					_ = sc.Close()
 				}
-				client.Close()
+				_ = client.Close()
 				srv.Close()
 			})
 
@@ -400,7 +400,7 @@ func TestCloseFrameReturnsEOF(t *testing.T) {
 
 func TestReadMessageOnClosedSocketErrors(t *testing.T) {
 	p := newWSPair(t)
-	p.client.Close()
+	_ = p.client.Close()
 
 	if _, err := p.server.ReadMessage(); err == nil {
 		t.Fatal("ReadMessage succeeded on a dead socket, want an error")
@@ -547,7 +547,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 // broadcast paths in the server rely on this.
 func TestWriteAfterCloseReturnsErrClosed(t *testing.T) {
 	p := newWSPair(t)
-	p.server.Close()
+	_ = p.server.Close()
 
 	err := p.server.WriteText([]byte("too late"))
 	if !errors.Is(err, net.ErrClosed) {

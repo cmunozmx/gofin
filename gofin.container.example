@@ -27,6 +27,9 @@ UserNS=keep-id
 
 [Service]
 Restart=on-failure
+# `systemctl --user reload gofin` rescans the libraries without a restart.
+# Quadlet names the container systemd-<unit> unless ContainerName= is set.
+ExecReload=/usr/bin/podman kill --signal HUP systemd-%N
 RestartSec=10
 
 [Install]

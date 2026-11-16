@@ -181,7 +181,7 @@ func yearAt(s string, i int) (int, bool) {
 	if s[i] != '1' && s[i] != '2' {
 		return 0, false
 	}
-	if !(s[i:i+2] == "19" || s[i:i+2] == "20") {
+	if s[i:i+2] != "19" && s[i:i+2] != "20" {
 		return 0, false
 	}
 	for k := i + 2; k < i+4; k++ {

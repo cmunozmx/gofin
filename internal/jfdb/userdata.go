@@ -57,7 +57,7 @@ func (s *Store) UserDataFor(userID jfid.GUID) (map[jfid.GUID]UserData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("user data: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make(map[jfid.GUID]UserData)
 	for rows.Next() {
@@ -167,7 +167,7 @@ func (s *Store) ResumeItems(userID jfid.GUID, limit int) ([]UserData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resume items: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []UserData{}
 	for rows.Next() {

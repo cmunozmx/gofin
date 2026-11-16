@@ -46,7 +46,7 @@ func Open(path string) (*DB, error) {
 		"PRAGMA busy_timeout = 5000",
 	} {
 		if _, err := sqlDB.Exec(pragma); err != nil {
-			sqlDB.Close()
+			_ = sqlDB.Close()
 			return nil, fmt.Errorf("%s: %w", pragma, err)
 		}
 	}
@@ -58,7 +58,7 @@ func Open(path string) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 
 	if err := migrate(sqlDB); err != nil {
-		sqlDB.Close()
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
 

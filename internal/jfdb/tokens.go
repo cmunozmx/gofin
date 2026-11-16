@@ -125,7 +125,7 @@ func (s *Store) TokensForUser(userID jfid.GUID) ([]*Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tokens for user: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []*Token{}
 	for rows.Next() {

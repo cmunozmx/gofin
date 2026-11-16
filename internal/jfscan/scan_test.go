@@ -519,7 +519,7 @@ func TestScanContinuesPastUnreadableDirectory(t *testing.T) {
 	if err := os.Chmod(bad, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(bad, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) })
 
 	res := scanMovies(t, root)
 	if len(res.Items) != 1 {
