@@ -76,7 +76,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
 	if _, err := conn.Write([]byte(resp)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return &Conn{raw: conn, br: brw.Reader}, nil

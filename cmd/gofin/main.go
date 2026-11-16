@@ -166,7 +166,7 @@ func load(fs *flag.FlagSet, path string) (*Config, error) {
 
 	if path != "" {
 		b, err := os.ReadFile(path)
-		if err != nil && !(errors.Is(err, os.ErrNotExist) && path == defaultConfigPath()) {
+		if err != nil && (!errors.Is(err, os.ErrNotExist) || path != defaultConfigPath()) {
 			return nil, fmt.Errorf("reading config %s: %w", path, err)
 		}
 		if err == nil {
@@ -437,7 +437,7 @@ func validateLibraryPaths(libs []Library) error {
 			return fmt.Errorf("library %q: cannot read %s: %w", l.Name, l.Path, err)
 		}
 		_, err = f.ReadDir(1)
-		f.Close()
+		_ = f.Close()
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("library %q: cannot list %s: %w", l.Name, l.Path, err)
 		}
@@ -1012,12 +1012,12 @@ func extractPicture(src, dst string) error {
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %w: %s", err, lastLines(out, 3))
 	}
 	fi, err := os.Stat(tmp)
 	if err != nil || fi.Size() == 0 {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return errors.New("no embedded picture")
 	}
 	return os.Rename(tmp, dst)
@@ -1681,7 +1681,7 @@ func (s *Server) routes() http.Handler {
 			http.Error(w, "favicon not found", 404)
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		w.Header().Set("Content-Type", "image/x-icon")
 		_, _ = io.Copy(w, f)
 	})
@@ -2607,7 +2607,7 @@ func (s *Server) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "No primary image")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
 		problem(w, http.StatusNotFound, "No primary image")
@@ -2964,7 +2964,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "Media file unavailable")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -3257,7 +3257,7 @@ func (s *Server) handleSocket(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("websocket upgrade failed", "err", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	const keepAliveSeconds = 30
 	send := func(msgType string, data any) error {
@@ -3521,7 +3521,7 @@ func main() {
 		log.Error("cannot open database", "path", dbPath, "err", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	log.Info("database", "path", dbPath)
 
 	store := jfdb.NewStore(db)

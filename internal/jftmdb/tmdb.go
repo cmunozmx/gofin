@@ -197,7 +197,7 @@ func (c *Client) DownloadPoster(ctx context.Context, posterPath, dest string) er
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("jftmdb: fetching poster: %s", resp.Status)
 	}
@@ -207,11 +207,11 @@ func (c *Client) DownloadPoster(ctx context.Context, posterPath, dest string) er
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 
 	// Cap the download: a corrupt or hostile response should not fill the disk.
 	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, 32<<20)); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -237,7 +237,7 @@ func (c *Client) getJSON(ctx context.Context, path string, into any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:

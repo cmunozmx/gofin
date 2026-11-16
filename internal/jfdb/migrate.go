@@ -112,7 +112,7 @@ func applyOne(db *sql.DB, i int) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 		}
 	}()
 

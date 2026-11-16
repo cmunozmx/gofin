@@ -95,7 +95,7 @@ func (s *Store) Users() ([]*User, error) {
 	if err != nil {
 		return nil, fmt.Errorf("users: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []*User{}
 	for rows.Next() {

@@ -104,7 +104,7 @@ func TestOpenRejectsANewerSchema(t *testing.T) {
 	if _, err := db.SQL().Exec("PRAGMA user_version = 99"); err != nil {
 		t.Fatalf("set user_version: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Downgrading must refuse rather than silently run migration 1 again over a
 	// schema it does not understand.

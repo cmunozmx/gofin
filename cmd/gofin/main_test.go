@@ -1847,7 +1847,7 @@ func TestValidateLibraryPathsUnreadableDirectory(t *testing.T) {
 	if err := os.Mkdir(locked, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 
 	if err := validateLibraryPaths([]Library{{Name: "Locked", Path: locked}}); err == nil {
 		t.Error("an unreadable directory should fail validation")
@@ -3011,10 +3011,10 @@ const tmdbHit = `{"results":[{"id":1,"title":"Arrival","release_date":"2016-11-1
 func TestFetchArtworkDownloadsPosters(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/img/") {
-			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			_, _ = w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
 			return
 		}
-		w.Write([]byte(tmdbHit))
+		_, _ = w.Write([]byte(tmdbHit))
 	})
 
 	e.srv.fetchArtwork()
@@ -3036,10 +3036,10 @@ func TestFetchArtworkDownloadsPosters(t *testing.T) {
 func TestFetchArtworkNeverWritesToTheMediaDirectory(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/img/") {
-			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			_, _ = w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
 			return
 		}
-		w.Write([]byte(tmdbHit))
+		_, _ = w.Write([]byte(tmdbHit))
 	})
 
 	moviesDir := e.srv.cfg.Libraries[0].Path
@@ -3062,7 +3062,7 @@ func TestFetchArtworkRecordsMisses(t *testing.T) {
 	var searches int32
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&searches, 1)
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 
 	e.srv.fetchArtwork()
@@ -3083,7 +3083,7 @@ func TestRefreshArtworkRetryMissed(t *testing.T) {
 	var searches int32
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&searches, 1)
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 
 	e.srv.fetchArtwork()
@@ -3134,7 +3134,7 @@ func TestFetchArtworkSkipsNonMovies(t *testing.T) {
 			queries = append(queries, q)
 			mu.Unlock()
 		}
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 
 	e.srv.fetchArtwork()
@@ -3154,10 +3154,10 @@ func TestFetchArtworkSkipsNonMovies(t *testing.T) {
 func TestCachedPosterSurvivesRescan(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/img/") {
-			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			_, _ = w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
 			return
 		}
-		w.Write([]byte(tmdbHit))
+		_, _ = w.Write([]byte(tmdbHit))
 	})
 
 	e.srv.fetchArtwork()
@@ -3181,10 +3181,10 @@ func TestCachedPosterSurvivesRescan(t *testing.T) {
 func TestFetchedPosterIsServed(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/img/") {
-			w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
+			_, _ = w.Write([]byte("\xff\xd8\xff\xe0JPEG"))
 			return
 		}
-		w.Write([]byte(tmdbHit))
+		_, _ = w.Write([]byte(tmdbHit))
 	})
 	e.srv.fetchArtwork()
 
@@ -3227,7 +3227,7 @@ func TestRefreshArtworkWithoutProvider(t *testing.T) {
 
 func TestRefreshArtworkRequiresAdmin(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 	if w := e.do(t, "POST", "/Library/RefreshArtwork", e.tokenFor(e.viewer), nil); w.Code != 403 {
 		t.Errorf("non-admin = %d, want 403", w.Code)
@@ -3242,7 +3242,7 @@ func TestFetchArtworkDoesNotRunTwice(t *testing.T) {
 	e, _ := tmdbEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		<-release
-		w.Write([]byte(`{"results":[]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 
 	done := make(chan struct{})
