@@ -1271,7 +1271,9 @@ func TestOptionalItemFeaturesReturnEmptyBody(t *testing.T) {
 
 	for _, path := range []string{
 		"/Episode/" + id + "/IntroTimestamps",
-		"/Users/" + id + "/Items/" + id + "/Intros",
+		// The pre-roll Intros route used to be here. It is a list upstream
+		// (UserLibraryController.GetIntros), so it now answers as one: see
+		// TestIntrosIsAnEmptyList.
 		"/Videos/" + id + "/Trickplay/320/tiles.m3u8",
 		"/Videos/" + id + "/Trickplay/320/0.jpg",
 	} {
@@ -1351,9 +1353,11 @@ func TestBaseURLStripping(t *testing.T) {
 	if w := e.do(t, "GET", "/jellyfin/System/Ping", "", nil); w.Code != 200 {
 		t.Errorf("prefixed request = %d, want 200", w.Code)
 	}
-	// The bare prefix must map to "/" rather than the empty path.
-	if w := e.do(t, "GET", "/jellyfin", "", nil); w.Code != 501 {
-		t.Errorf("bare prefix = %d, want the catch-all 501", w.Code)
+	// The bare prefix must map to "/" rather than the empty path. "/" used to
+	// be the 501 catch-all; it is now the redirect to the landing page (see
+	// web.go), which has to keep the prefix it was reached through.
+	if w := e.do(t, "GET", "/jellyfin", "", nil); w.Code != 302 || w.Header().Get("Location") != "/jellyfin/api-docs/swagger" {
+		t.Errorf("bare prefix = %d -> %q, want 302 -> /jellyfin/api-docs/swagger", w.Code, w.Header().Get("Location"))
 	}
 	// Unprefixed requests still reach the mux, since some clients drop it.
 	if w := e.do(t, "GET", "/System/Ping", "", nil); w.Code != 200 {
@@ -2397,8 +2401,8 @@ func TestDisplayPreferences(t *testing.T) {
 	}
 }
 
-// Writes are accepted and dropped. An error here makes some clients retry in a
-// loop.
+// A write is answered 204. An error here makes some clients retry in a loop.
+// (That it is also stored is TestDisplayPreferencesPersist.)
 func TestDisplayPreferencesWriteIsAccepted(t *testing.T) {
 	e := libEnv(t)
 	w := e.do(t, "POST", "/DisplayPreferences/usersettings", e.tokenFor(e.viewer),
@@ -2484,6 +2488,10 @@ func scannedEnv(t *testing.T) (*testEnv, string) {
 	}
 	e.srv.cfg.Libraries = libs
 	e.srv.cfg.Paths.Data = filepath.Join(root, "data")
+	// Set before the scan, not after: a scan starts the embedded-art
+	// extractor in the background, which reads this path. Leaving it at the
+	// default also meant every run wrote ./cache into the source tree.
+	e.srv.cfg.Paths.Cache = filepath.Join(root, "cache")
 	e.handler = e.srv.routes()
 
 	e.srv.scanLibraries()
@@ -2965,6 +2973,43 @@ func TestImageTagsOnlyWhenArtworkExists(t *testing.T) {
 	}
 }
 
+// A poster doubles as the item's only backdrop. Delfin's wide Home rows
+// (Latest, Continue Watching) build their URL from Thumb or BackdropImageTags
+// alone, so without one those tiles never get an image at all.
+func TestPosterDoublesAsBackdrop(t *testing.T) {
+	e, _ := scannedEnvWithArt(t)
+	tok := e.tokenFor(e.viewer)
+
+	var views QueryResult[BaseItemDto]
+	decodeJSON(t, e.do(t, "GET", "/UserViews", tok, nil), &views)
+	var withArt *BaseItemDto
+	for _, v := range views.Items {
+		var kids QueryResult[BaseItemDto]
+		decodeJSON(t, e.do(t, "GET", "/Items?ParentId="+v.ID.String(), tok, nil), &kids)
+		for i := range kids.Items {
+			if kids.Items[i].ImageTags["Primary"] != "" {
+				withArt = &kids.Items[i]
+			}
+		}
+	}
+	if withArt == nil {
+		t.Fatal("no item advertised a Primary image tag")
+	}
+
+	if got := withArt.BackdropImageTags; len(got) != 1 || got[0] != withArt.ImageTags["Primary"] {
+		t.Errorf("BackdropImageTags = %v, want [%s]", got, withArt.ImageTags["Primary"])
+	}
+	for _, p := range []string{"Backdrop", "Backdrop/0"} {
+		w := e.do(t, "GET", "/Items/"+withArt.ID.String()+"/Images/"+p, "", nil)
+		if w.Code != 200 || !strings.HasPrefix(w.Body.String(), "\xff\xd8\xff") {
+			t.Errorf("%s = %d, want 200 with the poster", p, w.Code)
+		}
+	}
+	if w := e.do(t, "GET", "/Items/"+withArt.ID.String()+"/Images/Backdrop/1", "", nil); w.Code != 404 {
+		t.Errorf("Backdrop/1 = %d, want 404: there is only one backdrop", w.Code)
+	}
+}
+
 func TestNonPrimaryImageTypeIs404(t *testing.T) {
 	e, _ := scannedEnvWithArt(t)
 	var views QueryResult[BaseItemDto]
@@ -2992,7 +3037,7 @@ func TestImageRejectsMalformedID(t *testing.T) {
 // network.
 func tmdbEnv(t *testing.T, handler http.HandlerFunc) (*testEnv, *httptest.Server) {
 	t.Helper()
-	e, root := scannedEnv(t)
+	e, _ := scannedEnv(t)
 
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -3002,7 +3047,6 @@ func tmdbEnv(t *testing.T, handler http.HandlerFunc) (*testEnv, *httptest.Server
 	c.ImageBase = srv.URL + "/img"
 	c.MinInterval = 0
 	e.srv.tmdb = c
-	e.srv.cfg.Paths.Cache = filepath.Join(root, "cache")
 	return e, srv
 }
 

@@ -84,6 +84,7 @@ systemctl --user start gofin
 systemctl --user status gofin                # Check status
 systemctl --user logs gofin -f               # Tail logs
 systemctl --user restart gofin               # Restart
+systemctl --user reload gofin                # Rescan libraries (sends SIGHUP)
 systemctl --user stop gofin                  # Stop
 ```
 
@@ -93,8 +94,100 @@ systemctl --user stop gofin                  # Stop
 - **Persistent state** in `~/.local/share/gofin/` for data, cache, logs, and config
 - **Configuration** via `~/.config/gofin/gofin.json`
 - **Port 8096** published for client access
+- **The web interface** baked into the image, so Jellyfin Desktop and a browser
+  work against it as they do against a real server
 
 The service restarts automatically on failure and integrates with systemd's user session.
+
+## Rescanning libraries
+
+The server scans every library at startup. To pick up new media without a
+restart, either:
+
+- send the process `SIGHUP` (`kill -HUP <pid>`, or `systemctl --user reload gofin`
+  with the Quadlet above), or
+- call the API with an administrator token:
+
+```sh
+# Log in once to get a token (AccessToken in the response)
+curl -s -X POST http://localhost:8096/Users/AuthenticateByName \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: MediaBrowser Client="curl", Device="cli", DeviceId="cli", Version="1.0"' \
+  -d '{"Username":"admin","Pw":"<password>"}'
+
+curl -X POST -H "X-Emby-Token: <AccessToken>" http://localhost:8096/Library/Refresh
+```
+
+A rescan that is already running is not restarted; the second request is ignored.
+
+## API documentation
+
+An OpenAPI 3 description of every registered endpoint is served at
+`/api-docs/openapi.json`, with Swagger UI at `/api-docs/swagger`. It is generated
+from the routes themselves, so methods, paths, path parameters and which
+endpoints need a token (or an administrator) are always current; query
+parameters and body shapes are not described. Use **Authorize** with the
+`AccessToken` from `/Users/AuthenticateByName` to try authenticated calls.
+Swagger UI's assets load from cdn.jsdelivr.net, so the browser needs internet
+access.
+
+## Web interface
+
+gofin serves the official Jellyfin web interface under `/web/`, and `/`
+redirects there. That is what a browser gets, and it is also what **Jellyfin
+Desktop** and the mobile wrappers get: they are shells with no interface of
+their own, and load it from whichever server they are pointed at. Without it
+they show "Error loading client".
+
+The interface is not in this repository or in the binary. It is a folder named
+by `web.dir` -- an unpacked `jellyfin-web` build, with `index.html` in it --
+served the way upstream serves it (`$JF/Jellyfin.Server/Startup.cs`).
+
+- **The container image already has it.** The `Dockerfile` downloads the
+  upstream release archive, checks it against a pinned SHA-256, keeps only the
+  `jellyfin-web` folder, and sets `JELLYFIN_WEB_DIR`. Nothing to configure.
+  To move to another release, change `JELLYFIN_VERSION` and `JELLYFIN_SHA256`
+  together, staying on the release line gofin reports itself as (10.11).
+- **Outside the container**, unpack a release and point at the folder:
+
+  ```sh
+  V=10.11.11
+  curl -fsSLO https://repo.jellyfin.org/files/server/portable/stable/v$V/any/jellyfin_$V.tar.xz
+  mkdir web && tar -xJf jellyfin_$V.tar.xz -C web --strip-components=2 jellyfin/jellyfin-web
+  ./gofin serve --webdir ./web        # or "web": {"enabled": true, "dir": "./web"}
+  ```
+
+- `--webdir` and `JELLYFIN_WEB_DIR` switch it on by naming the folder;
+  `--no-web` switches it off. Off, the server is API-only and `/` redirects to
+  the API docs.
+- A `web.dir` with no `index.html` in it is logged as an error and the server
+  starts API-only. A mistake about the interface does not take the API down.
+
+Two things to know when using it:
+
+- **There is no transcoding**, so a film plays in a plain browser only if the
+  browser can decode it (broadly: H.264/AAC in MP4, and most audio). Jellyfin
+  Desktop plays through mpv and has no such limit.
+- **The admin dashboard is not implemented.** The pages under *Administration*
+  ask for routes this server does not have.
+
+What the interface needed beyond what native clients had already driven is in
+`webapi.go`, `itemquery.go`, `caseroute.go` and `displayprefs.go`, each found
+by running the interface against the server and reading the warnings:
+
+- **Routing ignores case**, as ASP.NET's does. The interface asks for
+  `/users/public` and `/Localization/cultures`, and spells query parameters
+  both `ParentId` and `parentId`.
+- **The item query honours what it is asked**: search term, favourites and
+  played filters, type and media-type lists (comma-separated or as repeated
+  keys), sort order, the alphabet strip, ids, album and artist. A recursive
+  query with no `ParentId` used to answer with the library folders whatever
+  else it said, which listed "Movies" and "Music" as favourite episodes.
+- **Lists of things the scanner does not record are empty, not errors**:
+  genres, people, studios, similar items, recommendations, theme media. A
+  query *restricted* to one of them matches nothing rather than everything.
+- **Display preferences persist** (below), because the interface keeps a
+  user's settings there.
 
 ## Configuring libraries
 
@@ -212,7 +305,7 @@ go test ./...
 go test -race ./...     # the WebSocket write path is concurrent; this matters
 ```
 
-272 test functions, 458 cases with subtests, all passing and race-clean.
+324 test functions, 536 cases with subtests, all passing and race-clean.
 
 Where a value could be checked against something other than this code, it is.
 The PBKDF2-SHA512 known answers and the stored-hash fixtures come from Python's
@@ -250,7 +343,13 @@ other), and identical responses for a bad password and a missing user.
 | `/Users/AuthenticateByName`, `/Users/Me`, `/Users/Public` | complete, tested |
 | `/socket` handshake + `ForceKeepAlive` + `KeepAlive` | complete, tested |
 | `/UserViews`, `/Users/{id}/Views` — libraries appear in clients | complete, tested |
-| `/DisplayPreferences/{id}` — defaults; writes still discarded | partial, tested |
+| `/DisplayPreferences/{id}` — stored per user, id and client | complete, tested |
+| Web interface served from `web.dir` under `/web/`; `/` redirects | complete, tested |
+| Case-insensitive routes and query parameter names | complete, tested |
+| Item query: search, filters, sort, name ranges, ids, album/artist | complete, tested |
+| `/Users`, `/Users/{id}`, `/Artists`, `/Localization/Cultures`, grouping options | complete, tested |
+| Genres, people, studios, similar, recommendations, theme media | empty by design, tested |
+| Admin dashboard routes | not started |
 | Subscription tickers (`Sessions`, `ScheduledTasksInfo`) | TODO, marked |
 | `jfnaming` — Emby.Naming port: titles, years, stacks, extras | complete, tested |
 | `jfscan` — movie + music scanner, ignore rules, symlink-loop safe | complete, tested |
@@ -263,7 +362,6 @@ other), and identical responses for a bad password and a missing user.
 | Tokens and logins survive a restart | complete, tested |
 | Favourites, watched state, resume points | complete, tested |
 | `/Sessions/Logout`, `DELETE /Sessions/AccessToken` | complete, tested |
-| Display preferences — table exists, handlers not wired | not started |
 | Item repository in SQLite — still in memory, rescan on boot | not started |
 | Playback: direct play + byte-range streaming | complete, tested |
 | Transcoding, metadata providers beyond TMDB, TV episodes | not started |
@@ -407,11 +505,15 @@ What now survives a restart:
   runtime marks it played and clears the resume point so it leaves Continue
   Watching.
 
+- **Display preferences**, keyed on user, preferences id and client. A native
+  client keeps a few view settings there; the web interface keeps a user's
+  whole configuration -- theme, language, home screen layout -- under the id
+  `usersettings`, so until these were stored every setting reverted on reload.
+  A write is always answered 204, even one that could not be stored: an error
+  makes some clients retry in a loop.
+
 What still does not:
 
-- **Display preferences.** `POST /DisplayPreferences` still discards its body
-  and `GET` still serves hardcoded defaults, even though the table and its
-  repository methods exist and are tested. This is the last `io.Discard` sink.
 - **The item store.** `ItemStore` is still in memory, so every boot re-scans —
   about 3s cold, 12ms once the directory entries are in page cache. It is
   deliberately shaped for the swap: replaced wholesale at the end of a scan, so
@@ -449,6 +551,10 @@ a log full of repeated requests:
   tags.
 - A poster requested twice in the same millisecond is two UI elements asking for
   the same file, not a retry loop.
+- The web interface's files go out with `Last-Modified` and are revalidated;
+  `index.html` is `no-cache`, as upstream sends it, because it names the
+  content-hashed bundles and a stale copy pins a client to a build that an
+  upgrade has since removed.
 
 ## The one test that decides whether migration works
 
@@ -540,30 +646,27 @@ right for 4xx and nonsense for everything else — a 501 advertised
 
 0. Fix the `jftime` bug above — cheap now, more expensive once anything depends
    on the current wire shape.
-1. **Wire display preferences.** The table and its four repository methods are
-   built and tested; two handlers need to read and write them, keyed on
-   `(user, prefs_id, client)`. The last `io.Discard` sink in the tree.
-2. **Handler tests for the new routes.** `internal/jfdb` has 43 of its own, but
+1. **Handler tests for the new routes.** `internal/jfdb` has 43 of its own, but
    favourites, played, resume, logout and the playback reporters have no
    coverage at the HTTP layer. The one worth writing first is a round trip:
    report progress, restart, confirm `/Items/Resume` returns the item.
-3. `RunTimeTicks` in item listings. `ffprobe` output is already cached under
+2. `RunTimeTicks` in item listings. `ffprobe` output is already cached under
    `cache/probe/`; `toItemDto` just does not read it. Durations are what make a
    progress bar work in a browse view.
-4. Generate the remaining handlers from a real server's
+3. Generate the remaining handlers from a real server's
    `/api-docs/openapi.json` with `oapi-codegen`, so the compiler tracks what is
    left. `$JF` can produce the spec without a running server.
-5. TV: port the episode expressions from
+4. TV: port the episode expressions from
    `$JF/Emby.Naming/Common/NamingOptions.cs` (`EpisodeExpressions`) and the
    `Emby.Naming/TV/` resolvers. `jfscan` currently treats a `tvshows` library as
    loose video files, which is honest but not useful.
-6. The WebSocket subscription tickers, so a client's dashboard stops waiting
+5. The WebSocket subscription tickers, so a client's dashboard stops waiting
    forever for `ScheduledTasksInfo` that never arrives. `GET /Sessions` also
    still returns `[]` — there is no session registry, and `handleSocket` keeps
    its connection on the goroutine stack rather than in one.
-7. The item store in SQLite, with an ancestors closure table so boot stops
+6. The item store in SQLite, with an ancestors closure table so boot stops
    re-scanning and `Descendants` becomes a join.
 
 Done since this list was written: `Emby.Naming`, the scanner and item
-repository, library browsing, direct-play streaming, and SQLite persistence for
-users, tokens and user data.
+repository, library browsing, direct-play streaming, SQLite persistence for
+users, tokens, user data and display preferences, and the web interface.

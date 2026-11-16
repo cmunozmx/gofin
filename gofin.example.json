@@ -175,8 +175,16 @@
 
   "web": {
     "//": [
-      "Serve a jellyfin-web dist from disk. Leave disabled for an API-only",
-      "server; point dir at an unpacked jellyfin-web build to serve the UI too."
+      "The web interface, which is also what Jellyfin Desktop and the mobile",
+      "wrappers load from the server. dir is an unpacked jellyfin-web build:",
+      "a folder with index.html in it, taken from a Jellyfin 10.11 release.",
+      "It is served under /web/, and / redirects there. Disabled, the server",
+      "is API-only and / redirects to the API docs instead.",
+      "",
+      "The container image ships the interface and switches it on by setting",
+      "JELLYFIN_WEB_DIR, so leave this alone there. Setting that variable or",
+      "passing -webdir enables it without enabled=true; -no-web turns it off.",
+      "A dir with no index.html is logged as an error and served API-only."
     ],
     "enabled": false,
     "dir": ""
